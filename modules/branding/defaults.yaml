@@ -1,0 +1,5 @@
+# modules/branding/defaults.yaml
+institute_name: "IES College of Architecture"
+theme:
+  primary: "#0ea5e9"
+  accent: "#22c55e"

@@ -1,0 +1,12 @@
+# modules/degrees/schema.yaml
+id: auto
+fields:
+  - name: code
+    type: text
+    required: true
+  - name: title
+    type: text
+    required: true
+  - name: status
+    type: select
+    options: ["active", "inactive"]

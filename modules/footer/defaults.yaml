@@ -1,0 +1,8 @@
+# modules/footer/defaults.yaml
+enabled: true
+footer_text: "© IESCOA • All rights reserved"
+designer_name: ""
+designer_url: ""
+links:
+  - label: "Privacy"
+    url: "#"

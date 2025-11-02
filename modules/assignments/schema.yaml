@@ -1,0 +1,17 @@
+# modules/assignments/schema.yaml
+id: auto
+fields:
+  - name: degree_code
+    type: ref
+    ref: degrees.code
+  - name: assignment_code
+    type: text
+    required: true
+  - name: title
+    type: text
+  - name: max_marks
+    type: number
+    default: 100
+  - name: require_approval
+    type: boolean
+    default: false
