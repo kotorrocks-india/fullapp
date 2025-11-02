@@ -1,0 +1,774 @@
+# app/screens/students/importer.py
+# -------------------------------------------------------------------
+# All Student Import/Export, Credential, and Mover functions
+# -------------------------------------------------------------------
+from __future__ import annotations
+from typing import List, Tuple, Dict, Any, Optional, Set
+from dataclasses import dataclass, field
+import pandas as pd
+import streamlit as st
+from sqlalchemy import text as sa_text
+from sqlalchemy.engine import Engine, Connection
+from collections import defaultdict
+import logging
+
+# Import common helpers
+from screens.faculty.utils import _safe_int_convert, _handle_error
+from screens.faculty.db import _active_degrees
+
+# --- NEW: Import from our new student db.py file ---
+from screens.students.db import (
+    _ensure_student_username_and_initial_creds,
+    _get_student_credentials_to_export,
+    _get_existing_enrollment_data,
+    _db_get_batches_for_degree,
+    _db_get_students_for_mover,
+    _db_move_students
+)
+
+# Setup logger
+log = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
+# Helpers for Stateful Import (Batch/Year Validation)
+# ------------------------------------------------------------------
+
+@dataclass
+class EnrollmentCheckResult:
+    """Holds the data from pre-checking student enrollments."""
+    unmatched_batches: Set[str] = field(default_factory=set)
+    existing_batches: List[str] = field(default_factory=list)
+    unmatched_years: Set[str] = field(default_factory=set)
+    existing_years: List[str] = field(default_factory=list)
+    ignored_rows: int = 0
+
+
+def _pre_check_student_enrollments(df: pd.DataFrame, engine: Engine, degree_code: str) -> Tuple[EnrollmentCheckResult, pd.DataFrame]:
+    """
+    Compares the CSV data against the database for a single degree
+    to find unmatched batches and years.
+    """
+    degree_code_clean = degree_code.strip()
+    
+    # 1. Clean and Filter DataFrame
+    for col in ['degree_code', 'batch', 'current_year']:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().replace('nan', '')
+
+    df_filtered = df[df['degree_code'].str.lower() == degree_code_clean.lower()].copy()
+    ignored_rows = len(df) - len(df_filtered)
+    
+    if df_filtered.empty:
+        raise ValueError(f"No rows found in the CSV for the selected degree '{degree_code_clean}'.")
+
+    # 2. Get unique codes from the *filtered* CSV
+    csv_batches = set(df_filtered['batch'].dropna().unique()) - {''}
+    csv_years = set(df_filtered['current_year'].dropna().unique()) - {''}
+
+    # 3. Get existing codes from the DB
+    existing_data = _get_existing_enrollment_data(engine, degree_code_clean) # <-- Uses new DB function
+    db_batches = set(existing_data['batches'])
+    db_years = set(existing_data['years'])
+
+    # 4. Find the mismatches
+    result = EnrollmentCheckResult(
+        unmatched_batches=csv_batches - db_batches,
+        existing_batches=sorted(list(db_batches)),
+        unmatched_years=csv_years - db_years,
+        existing_years=sorted(list(db_years)),
+        ignored_rows=ignored_rows
+    )
+    return result, df_filtered
+
+
+def _build_translation_map(
+    mappings: Dict[str, Dict[str, str]]
+) -> Dict[str, Dict[str, str]]:
+    """
+    Converts the raw UI mappings into a clean translation map
+    for the import function.
+    """
+    translation_map = {}
+    for aff_type, type_mappings in mappings.items():
+        translation_map[aff_type] = {}
+        for code, action in type_mappings.items():
+            if action == "[USE_NEW]":
+                translation_map[aff_type][code] = code  # Map to itself
+            else:
+                translation_map[aff_type][code] = action
+    return translation_map
+
+# ------------------------------------------------------------------
+# Main Import Logic (with Batch/Year Mapping)
+# ------------------------------------------------------------------
+
+def _show_no_degrees_help(engine: Engine, context: str = "student operations"):
+    """
+    Shows a helpful setup guide when no degrees exist.
+    Returns True if degrees exist, False otherwise.
+    """
+    with engine.begin() as conn:
+        degrees = _active_degrees(conn)
+    
+    if degrees:
+        return True
+    
+    # No degrees found - show setup guide
+    st.warning(f"⚠️ No degrees found. You need to set up degrees before performing {context}.")
+    
+    st.markdown("""
+    ### 🚀 Getting Started
+    
+    To import students, you need to first create the academic structure:
+    
+    1. **Create Degrees** (e.g., BTech, MTech, MBA)
+    2. *(Optional)* Create Programs and Branches
+    3. **Import Students** using the CSV template
+    """)
+    
+    with st.expander("➕ Quick Create Your First Degree", expanded=True):
+        st.info("Create a degree to unlock student import functionality.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            degree_code = st.text_input(
+                "Degree Code*", 
+                placeholder="e.g., BTech, MTech",
+                key=f"quick_degree_code_{context}"
+            )
+        with col2:
+            degree_name = st.text_input(
+                "Degree Name (optional)", 
+                placeholder="e.g., Bachelor of Technology",
+                key=f"quick_degree_name_{context}"
+            )
+        
+        if st.button("✨ Create Degree", type="primary", key=f"create_degree_{context}"):
+            if not degree_code or not degree_code.strip():
+                st.error("❌ Degree code is required")
+            else:
+                try:
+                    with engine.begin() as conn:
+                        # Check if degree already exists
+                        existing = conn.execute(sa_text(
+                            "SELECT 1 FROM degrees WHERE LOWER(code) = LOWER(:code)"
+                        ), {"code": degree_code.strip()}).fetchone()
+                        
+                        if existing:
+                            st.error(f"❌ Degree '{degree_code}' already exists")
+                        else:
+                            conn.execute(sa_text("""
+                                INSERT INTO degrees (code, name, active, sort_order, created_at, updated_at)
+                                VALUES (:code, :name, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """), {
+                                "code": degree_code.strip(),
+                                "name": degree_name.strip() or degree_code.strip()
+                            })
+                            st.success(f"✅ Created degree: **{degree_code}**")
+                            st.cache_data.clear()
+                            st.balloons()
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Failed to create degree: {e}")
+                    log.error(f"Degree creation failed: {e}")
+    
+    st.divider()
+    st.info("💡 **Alternative:** If you have a dedicated Degrees management page, you can create degrees there with more options.")
+    
+    return False
+
+
+def _import_students_with_validation(
+    engine: Engine, 
+    df: pd.DataFrame, 
+    dry_run: bool,
+    mappings: Optional[Dict[str, Dict[str, str]]] = None,
+    conn_for_transaction: Optional[Connection] = None
+) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    """
+    Import combined student profiles and enrollments with validation AND MAPPINGS.
+    
+    RETURNS: (errors, success_count, skipped_rows)
+    """
+    df.columns = [col.lower().strip().replace(' ', '_') for col in df.columns]
+
+    errors: List[Dict[str, Any]] = []
+    skipped_rows: List[Dict[str, Any]] = []
+    success_count = 0
+    
+    translation_map = _build_translation_map(mappings) if mappings else {}
+
+    # Metadata fetch (this is safe, it creates and closes its own connection)
+    with engine.begin() as meta_conn:
+        all_degrees = _active_degrees(meta_conn)
+
+    # --- NEW TRANSACTION LOGIC ---
+    if conn_for_transaction:
+        conn = conn_for_transaction
+        trans = conn.begin_nested()
+        should_close = False
+    else:
+        conn = engine.connect()
+        trans = conn.begin()
+        should_close = True
+    # --- END NEW LOGIC ---
+
+    try:
+        for idx, row in df.iterrows():
+            row_num = idx + 2
+            try:
+                # 1. Validate Profile Data
+                email = str(row.get('email', '')).strip().lower()
+                student_id = str(row.get('student_id', '')).strip()
+                name = str(row.get('name', '')).strip()
+                
+                if not name or not email or not student_id:
+                    errors.append({'row': row_num, 'email': email, 'error': "Missing required fields: name, email, and student_id"})
+                    continue
+                
+                # 2. Upsert Profile
+                profile_id = conn.execute(sa_text(
+                    "SELECT id FROM student_profiles WHERE student_id = :sid"
+                ), {"sid": student_id}).fetchone()
+                
+                if profile_id:
+                    profile_id = profile_id[0]
+                    conn.execute(sa_text("""
+                        UPDATE student_profiles
+                        SET name = :name, email = :email, phone = :phone, status = :status,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = :id
+                    """), {
+                        "name": name, "email": email, "phone": row.get('phone'),
+                        "status": row.get('status', 'active'), "id": profile_id
+                    })
+                else:
+                    res = conn.execute(sa_text("""
+                        INSERT INTO student_profiles (name, email, student_id, phone, status)
+                        VALUES (:name, :email, :sid, :phone, :status)
+                        RETURNING id
+                    """), {
+                        "name": name, "email": email, "sid": student_id,
+                        "phone": row.get('phone'), "status": row.get('status', 'active')
+                    })
+                    profile_id = res.fetchone()[0]
+                
+                # 3. Ensure Credentials Exist (Uses imported function)
+                _ensure_student_username_and_initial_creds(
+                    conn, profile_id, email, name, student_id
+                )
+                
+                # 4. Process Enrollment
+                degree_code = str(row.get('degree_code', '')).strip()
+                
+                if degree_code:
+                    if degree_code not in all_degrees:
+                        errors.append({'row': row_num, 'email': email, 'error': f"Degree '{degree_code}' not found."})
+                        continue
+                        
+                    batch = str(row.get('batch', '')).strip()
+                    current_year = str(row.get('current_year', '')).strip()
+                    
+                    if not batch or not current_year:
+                        errors.append({'row': row_num, 'email': email, 'error': "Missing 'batch' or 'current_year' for enrollment."})
+                        continue
+                    
+                    # Apply mappings
+                    mapped_batch = translation_map.get('batch', {}).get(batch, batch)
+                    mapped_year = translation_map.get('year', {}).get(current_year, current_year)
+                    
+                    # Check for [IGNORE]
+                    if mapped_batch == "[IGNORE]" or mapped_year == "[IGNORE]":
+                        log.debug(f"Row {row_num}: Ignoring enrollment due to user mapping.")
+                        skipped_rows.append({
+                            "row": row_num, "email": email, "reason": "Ignored by user mapping rule."
+                        })
+                        continue 
+                    
+                    program_code = str(row.get('program_code', '')).strip() or None
+                    branch_code = str(row.get('branch_code', '')).strip() or None
+                    
+                    # Upsert Enrollment
+                    enrollment_id = conn.execute(sa_text("""
+                        SELECT id FROM student_enrollments
+                        WHERE student_profile_id = :pid AND degree_code = :degree AND batch = :batch
+                    """), {
+                        "pid": profile_id, "degree": degree_code, "batch": mapped_batch
+                    }).fetchone()
+                    
+                    if enrollment_id:
+                        conn.execute(sa_text("""
+                            UPDATE student_enrollments
+                            SET program_code = :prog, branch_code = :branch, 
+                                current_year = :year, enrollment_status = :status,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :id
+                        """), {
+                            "prog": program_code, "branch": branch_code,
+                            "year": mapped_year, "status": row.get('enrollment_status', 'active'),
+                            "id": enrollment_id[0]
+                        })
+                    else:
+                        conn.execute(sa_text("""
+                            INSERT INTO student_enrollments (
+                                student_profile_id, degree_code, program_code, branch_code,
+                                batch, current_year, enrollment_status, is_primary
+                            ) VALUES (
+                                :pid, :degree, :prog, :branch,
+                                :batch, :year, :status, 1
+                            )
+                        """), {
+                            "pid": profile_id, "degree": degree_code, "prog": program_code, "branch": branch_code,
+                            "batch": mapped_batch, "year": mapped_year, 
+                            "status": row.get('enrollment_status', 'active')
+                        })
+                
+                success_count += 1
+
+            except Exception as e:
+                errors.append({'row': row_num, 'email': email, 'error': str(e)})
+
+        if dry_run:
+            trans.rollback()
+        else:
+            trans.commit()
+    except Exception:
+        if trans:
+            trans.rollback()
+        raise
+    finally:
+        if should_close:
+            conn.close()
+
+    return errors, success_count, skipped_rows
+    
+# ------------------------------------------------------------------
+# STATEFUL IMPORT UI (The Main Feature)
+# ------------------------------------------------------------------
+
+def _reset_student_import_state():
+    """Resets the session state for the student import wizard."""
+    st.session_state.student_import_step = 'initial'
+    st.session_state.student_import_mappings = {}
+    st.session_state.student_import_validation_data = None
+    st.session_state.student_import_df = None
+    # st.session_state.student_import_degree = None # Keep degree
+    log.debug("Resetting student import state.")
+
+
+def _add_student_import_export_section(engine: Engine):
+    """
+    UI for managing student import/export, including stateful
+    validation for Batches and Years.
+    """
+    
+    st.divider()
+    st.subheader("🔥📤 Combined Student Import/Export")
+
+    if not _show_no_degrees_help(engine, "student import"):
+        return
+
+
+    # --- 1. State Initialization ---
+    if 'student_import_step' not in st.session_state:
+        _reset_student_import_state()
+
+
+    # --- 2. Select Degree ---
+    with engine.begin() as conn:
+        degrees = _active_degrees(conn)
+    if not degrees:
+        st.error("❌ No degrees available. Please create degrees first.")
+        st.info("💡 **Next Steps:**\n"
+                "1. Navigate to the **Degrees** or **Settings** page\n"
+                "2. Create at least one degree (e.g., 'BTech', 'MTech')\n"
+                "3. Return here to import students")
+        return
+
+    if st.session_state.get('student_import_degree'):
+        selected_degree = st.session_state.student_import_degree
+        st.info(f"📋 **Selected Degree:** `{selected_degree}`")
+    else:
+        selected_degree_raw = st.selectbox("Select Degree for Student Import", options=degrees, key="degree_selector_student")
+        if st.button("Confirm Degree Selection", type="primary"):
+            st.session_state.student_import_degree = selected_degree_raw.strip()
+            st.rerun()
+        st.warning("⚠️ Please confirm your degree selection to proceed with import.")
+        return
+
+    # --- 3. Export Section ---
+    with st.expander("📥 Export Student Data / Templates"):
+        st.download_button(
+            label="Download Combined Student Template",
+            data="name,email,student_id,phone,status,degree_code,program_code,branch_code,batch,current_year,enrollment_status",
+            file_name="student_combined_template.csv",
+            mime="text/csv"
+        )
+        # (A real _prepare_combined_student_export_data function would be built here)
+
+    # --- 4. File Uploader ---
+    st.markdown("### 📤 Import Student Data")
+    up = st.file_uploader("Upload Combined Student CSV", type="csv", key="student_uploader")
+    
+    if st.session_state.student_import_step != 'initial':
+        if st.button("🔄 Cancel Import & Start Over", key="cancel_student_import"):
+            _reset_student_import_state()
+            st.rerun()
+        st.divider()
+
+    # --- 6. State: Initial (Validation) ---
+    if st.session_state.student_import_step == 'initial':
+        st.markdown("#### Step 1: Validate File")
+        if not up:
+            st.warning("Please upload a CSV file to begin.")
+            if 'student_import_df' in st.session_state:
+                _reset_student_import_state()
+            return
+
+        if st.button("🔍 Validate File", type="primary"):
+            try:
+                up.seek(0)
+                df = pd.read_csv(up)
+                with st.spinner("Validating CSV for new batches and years..."):
+                    validation_data, filtered_df = _pre_check_student_enrollments(df, engine, selected_degree)
+                
+                st.session_state.student_import_validation_data = validation_data
+                st.session_state.student_import_df = filtered_df
+                st.session_state.student_import_mappings = {"batch": {}, "year": {}}
+                
+                if validation_data.ignored_rows > 0:
+                    st.info(f"✅ Found {len(filtered_df)} rows for degree '{selected_degree}'. "
+                            f"{validation_data.ignored_rows} rows for other degrees will be ignored.")
+
+                if validation_data.unmatched_batches:
+                    st.session_state.student_import_step = 'map_batches'
+                elif validation_data.unmatched_years:
+                    st.session_state.student_import_step = 'map_years'
+                else:
+                    st.session_state.student_import_step = 'ready_to_import'
+                st.rerun()
+            except Exception as e:
+                _handle_error(e, "Validation Failed")
+                _reset_student_import_state()
+
+    # --- 7. State: Map Batches ---
+    elif st.session_state.student_import_step == 'map_batches':
+        st.markdown("#### Step 2: Map Batches")
+        st.warning(f"⚠️ Your file contains Batches that are not in the database for **{selected_degree}**.")
+        
+        data: EnrollmentCheckResult = st.session_state.student_import_validation_data
+        options = ["[Select Action]"] + data.existing_batches + ["[-- Use New Batch --]", "[-- Ignore These Rows --]"]
+        
+        valid = True
+        col1, col2 = st.columns([1, 2])
+        col1.markdown("**CSV Value**")
+        col2.markdown("**Action**")
+
+        for code in sorted(list(data.unmatched_batches)):
+            col1.write(f"`{code}`")
+            key = f"map_batch_{code}"
+            
+            stored_action = st.session_state.student_import_mappings['batch'].get(code, "[Select Action]")
+            if stored_action == "[USE_NEW]":
+                default_display_value = "[-- Use New Batch --]"
+            elif stored_action == "[IGNORE]":
+                default_display_value = "[-- Ignore These Rows --]"
+            else:
+                default_display_value = stored_action
+            
+            try:
+                default_index = options.index(default_display_value)
+            except ValueError:
+                default_index = 0
+            
+            choice = col2.selectbox(f"map_{code}", options=options, key=key, index=default_index, label_visibility="collapsed")
+
+            if choice == "[-- Use New Batch --]":
+                st.session_state.student_import_mappings['batch'][code] = "[USE_NEW]"
+            elif choice == "[-- Ignore These Rows --]":
+                st.session_state.student_import_mappings['batch'][code] = "[IGNORE]"
+            else:
+                st.session_state.student_import_mappings['batch'][code] = choice
+            
+            if choice == "[Select Action]":
+                valid = False
+
+        if st.button("➡️ Next", type="primary"):
+            if not valid:
+                st.error("❌ Please select an action for every item.")
+            else:
+                if data.unmatched_years:
+                    st.session_state.student_import_step = 'map_years'
+                else:
+                    st.session_state.student_import_step = 'ready_to_import'
+                st.rerun()
+
+    # --- 8. State: Map Years ---
+    elif st.session_state.student_import_step == 'map_years':
+        st.markdown("#### Step 3: Map Years")
+        st.warning(f"⚠️ Your file contains Years that are not in the database for **{selected_degree}**.")
+        
+        data: EnrollmentCheckResult = st.session_state.student_import_validation_data
+        options = ["[Select Action]"] + data.existing_years + ["[-- Use New Year --]", "[-- Ignore These Rows --]"]
+        
+        valid = True
+        col1, col2 = st.columns([1, 2])
+        col1.markdown("**CSV Value**")
+        col2.markdown("**Action**")
+
+        for code in sorted(list(data.unmatched_years)):
+            col1.write(f"`{code}`")
+            key = f"map_year_{code}"
+            
+            stored_action = st.session_state.student_import_mappings['year'].get(code, "[Select Action]")
+            if stored_action == "[USE_NEW]":
+                default_display_value = "[-- Use New Year --]"
+            elif stored_action == "[IGNORE]":
+                default_display_value = "[-- Ignore These Rows --]"
+            else:
+                default_display_value = stored_action
+            
+            try:
+                default_index = options.index(default_display_value)
+            except ValueError:
+                default_index = 0
+            
+            choice = col2.selectbox(f"map_{code}", options=options, key=key, index=default_index, label_visibility="collapsed")
+
+            if choice == "[-- Use New Year --]":
+                st.session_state.student_import_mappings['year'][code] = "[USE_NEW]"
+            elif choice == "[-- Ignore These Rows --]":
+                st.session_state.student_import_mappings['year'][code] = "[IGNORE]"
+            else:
+                st.session_state.student_import_mappings['year'][code] = choice
+            
+            if choice == "[Select Action]":
+                valid = False
+
+        if st.button("➡️ Next", type="primary"):
+            if not valid:
+                st.error("❌ Please select an action for every item.")
+            else:
+                st.session_state.student_import_step = 'ready_to_import'
+                st.rerun()
+
+    # --- 9. State: Ready to Import (Final Step) ---
+    elif st.session_state.student_import_step == 'ready_to_import':
+        st.markdown("#### Step 4: Review and Import")
+        st.success("✅ All data is validated and mapped. Ready to import.")
+
+        if 'student_import_df' not in st.session_state or st.session_state.student_import_df is None:
+            st.error("❌ Session data was lost. Please cancel and start over.")
+            return
+
+        with st.expander("🔍 Show Final Mappings"):
+            st.json(st.session_state.student_import_mappings)
+        
+        df_to_import = st.session_state.student_import_df
+        mappings = st.session_state.student_import_mappings
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🧪 Dry Run", key="dry_run_students"):
+                conn = engine.connect()
+                trans = conn.begin()
+                try:
+                    with st.spinner("Executing Dry Run... (no changes will be made)"):
+                        errors, success, skipped = _import_students_with_validation(
+                            engine, df_to_import, dry_run=True, mappings=mappings, 
+                            conn_for_transaction=conn
+                        )
+                            
+                    if errors:
+                        st.warning(f"⚠️ Dry run: {success} would succeed, {len(errors)} would fail")
+                        st.dataframe(pd.DataFrame(errors)[['row', 'email', 'error']], use_container_width=True)
+                    else:
+                        st.success(f"✅ Dry run: All {success} records would import successfully")
+                    
+                    if skipped:
+                        st.info(f"ℹ️ {len(skipped)} rows would be skipped due to your 'Ignore' mapping rules.")
+                    
+                except Exception as e:
+                    _handle_error(e, "Dry Run Failed")
+                    st.exception(e)
+                finally:
+                    trans.rollback()
+                    conn.close()
+                        
+        with col2:
+            if st.button("🚀 Execute Import", key="execute_students", type="primary"):
+                try:
+                    with st.spinner("Executing Import..."):
+                        errors, success, skipped = _import_students_with_validation(
+                            engine, df_to_import, dry_run=False, mappings=mappings
+                        )
+                    
+                    if errors:
+                        st.error(f"❌ Import completed with {len(errors)} errors out of {len(df_to_import)} rows")
+                        st.download_button(
+                            "Download Import Errors",
+                            pd.DataFrame(errors).to_csv(index=False),
+                            "student_import_errors.csv",
+                            "text/csv"
+                        )
+                    else:
+                        st.success(f"✅ Successfully imported {success} record(s)")
+                    
+                    if skipped:
+                        st.info(f"ℹ️ {len(skipped)} rows were skipped due to your 'Ignore' mapping rules.")
+                    
+                    st.cache_data.clear() # Clear cache to see new batches
+                    _reset_student_import_state()
+                    st.rerun()
+
+                except Exception as e:
+                    _handle_error(e, "Import failed.")
+
+
+# ------------------------------------------------------------------
+# UI SECTION 2: STUDENT MOVER
+# ------------------------------------------------------------------
+
+def _add_student_mover_section(engine: Engine):
+    """
+    UI for moving students in bulk from one enrollment (batch) to another.
+    """
+    st.divider()
+    st.subheader("🚚 Student Mover")
+    if not _show_no_degrees_help(engine, "student moving"):
+        return
+    st.info("Use this tool to move students between batches or degrees (e.g., at the start of a new academic year).")
+
+    with engine.begin() as conn:
+        all_degrees = _active_degrees(conn)
+    if not all_degrees:
+        st.warning("No degrees found.")
+        return
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**1. Select Students to Move**")
+        from_degree = st.selectbox("From Degree", all_degrees, key="move_from_degree")
+        
+        with engine.begin() as conn:
+            from_batches = _db_get_batches_for_degree(conn, from_degree)
+            
+        if not from_batches:
+            st.warning(f"No batches found for {from_degree}.")
+            return
+            
+        from_batch = st.selectbox("From Batch", from_batches, key="move_from_batch")
+        
+        if st.button("Get Student List"):
+            with engine.begin() as conn:
+                df_students = _db_get_students_for_mover(conn, from_degree, from_batch)
+                st.session_state.students_to_move_df = df_students
+            
+            if df_students.empty:
+                st.warning("No students found in this batch.")
+                
+    if "students_to_move_df" not in st.session_state:
+        st.write("Click 'Get Student List' to begin.")
+        return
+
+    st.markdown("**2. Select Students and Destination**")
+    
+    edited_df = st.data_editor(
+        st.session_state.students_to_move_df,
+        key="student_mover_editor",
+        use_container_width=True,
+        disabled=["Profile ID", "Student ID", "Name", "Email", "Current Year", "Enrollment ID"]
+    )
+    
+    students_to_move = edited_df[edited_df["Move"] == True]
+    
+    with col2:
+        st.markdown("**3. Select Destination**")
+        to_degree = st.selectbox("To Degree", all_degrees, key="move_to_degree", index=all_degrees.index(from_degree))
+        
+        # Allow creating a new batch or moving to an existing one
+        with engine.begin() as conn:
+            to_batches = _db_get_batches_for_degree(conn, to_degree)
+        
+        to_batch_option = st.radio("Batch Action", ["Move to Existing Batch", "Move to New Batch"], horizontal=True)
+        
+        if to_batch_option == "Move to Existing Batch":
+            if not to_batches:
+                st.error(f"No existing batches for {to_degree}.")
+                return
+            to_batch = st.selectbox("To Batch", to_batches, key="move_to_batch")
+        else:
+            to_batch = st.text_input("New Batch Name (e.g., '2022')", key="move_new_batch")
+            
+        to_year = st.number_input("Set New Year", min_value=1, max_value=10, value=1, key="move_to_year")
+
+    st.divider()
+
+    if students_to_move.empty:
+        st.warning("Select one or more students to move using the 'Move' checkbox.")
+        return
+        
+    if not to_batch:
+        st.warning("Please select or enter a destination batch.")
+        return
+
+    st.markdown(f"**Review Plan:**")
+    st.warning(f"You are about to move **{len(students_to_move)}** students from **{from_degree} (Batch {from_batch})** "
+               f"to **{to_degree} (Batch {to_batch})** and set their year to **{to_year}**.")
+    
+    if st.button("🚀 Execute Move", type="primary"):
+        enrollment_ids = students_to_move["Enrollment ID"].tolist()
+        try:
+            with engine.begin() as conn:
+                moved_count = _db_move_students(conn, enrollment_ids, to_degree, to_batch, to_year)
+            
+            st.success(f"Successfully moved {moved_count} students!")
+            st.cache_data.clear() # Clear cache to see changes
+            del st.session_state.students_to_move_df
+            st.rerun()
+        except Exception as e:
+            _handle_error(e, "Move Failed")
+
+
+# ------------------------------------------------------------------
+# UI SECTION 3: STUDENT CREDENTIAL EXPORT
+# ------------------------------------------------------------------
+
+def _add_student_credential_export_section(engine: Engine):
+    """
+    UI for exporting student initial credentials.
+    """
+    st.divider()
+    st.subheader("🔑 Export Student Initial Credentials")
+    
+    # This section doesn't strictly need degrees, but check anyway for consistency
+    with engine.begin() as conn:
+        degrees = _active_degrees(conn)
+    
+    if not degrees:
+        st.info("ℹ️ No degrees found. Create degrees and import students first to use credential export.")
+        # Still show the section but with disabled state
+    
+    st.info("This will generate a CSV of usernames and initial passwords for all "
+            "students marked for export. This action will also mark them as 'exported'.")
+            
+    if st.button("Generate and Download Student Credentials", disabled=(not degrees)):
+        try:
+            with st.spinner("Generating credential file..."):
+                df_creds = _get_student_credentials_to_export(engine)
+            
+            if df_creds.empty:
+                st.warning("No new student credentials to export.")
+                return
+
+            csv = df_creds.to_csv(index=False)
+            st.download_button(
+                "Download Credentials CSV",
+                data=csv,
+                file_name="student_initial_credentials.csv",
+                mime="text/csv"
+            )
+        except Exception as e:
+            _handle_error(e, "Failed to export credentials")

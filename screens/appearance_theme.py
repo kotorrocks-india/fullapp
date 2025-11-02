@@ -9,7 +9,7 @@ from core.settings import load_settings
 from core.db import get_engine, init_db
 from core.policy import require_page, user_roles, can_edit_page
 from core.theme_manager import get_app_theme
-from core.theme import decide_mode, inject_css, ensure_user_prefs_schema
+from core.theme import decide_mode, inject_css
 from core.ui import render_footer_global
 from core.theme_profiles import (
     list_profiles, load_profile, save_profile, delete_profile, apply_profile_to_draft
@@ -24,19 +24,134 @@ def _ensure_path(d: dict, path: list[str], default: dict | None = None) -> dict:
     return cur
 
 def _K(name: str) -> str:
+    """Helper to create unique session state keys"""
     return f"theme_cp_{name}"
 
-# --- DECORATOR HAS BEEN CORRECTED ---
-# The name now exactly matches the key in your policy.py file.
+def _set_path(d: dict, path: list[str], value):
+    """
+    Safely sets a value in a nested dictionary based on a list of keys.
+    e.g., _set_path(d, ["a", "b", "c"], 10) -> d["a"]["b"]["c"] = 10
+    """
+    cur = d
+    for i, key in enumerate(path):
+        if i == len(path) - 1:
+            cur[key] = value
+        else:
+            if key not in cur or not isinstance(cur[key], dict):
+                cur[key] = {}
+            cur = cur[key]
+
+# This CONFIG_MAP defines the single source of truth for the theme structure.
+# It maps the widget key (from _K()) to its path in the JSON config.
+CONFIG_MAP = {
+    # Design Tokens (Light)
+    _K("l_primary"): ["theme", "tokens", "light", "primary"],
+    _K("l_surface"): ["theme", "tokens", "light", "surface"],
+    _K("l_text"):    ["theme", "tokens", "light", "text"],
+    _K("l_muted"):   ["theme", "tokens", "light", "muted"],
+    _K("l_accent"):  ["theme", "tokens", "light", "accent"],
+    # Design Tokens (Dark)
+    _K("d_primary"): ["theme", "tokens", "dark", "primary"],
+    _K("d_surface"): ["theme", "tokens", "dark", "surface"],
+    _K("d_text"):    ["theme", "tokens", "dark", "text"],
+    _K("d_muted"):   ["theme", "tokens", "dark", "muted"],
+    _K("d_accent"):  ["theme", "tokens", "dark", "accent"],
+    # Components - Sidebar
+    _K("sb_bg"):  ["theme", "components", "sidebar", "colors", "background", "value"],
+    _K("sb_txt"): ["theme", "components", "sidebar", "colors", "text", "value"],
+    _K("sb_acc"): ["theme", "components", "sidebar", "colors", "accent", "value"],
+    # Components - Tables
+    _K("tb_hbg"): ["theme", "components", "tables", "colors", "header_bg", "value"],
+    _K("tb_htx"): ["theme", "components", "tables", "colors", "header_text", "value"],
+    _K("tb_rbg"): ["theme", "components", "tables", "colors", "row_bg", "value"],
+    _K("tb_rtx"): ["theme", "components", "tables", "colors", "row_text", "value"],
+    _K("tb_brd"): ["theme", "components", "tables", "colors", "border", "value"],
+    # Components - Dropdowns
+    _K("dd_bg"):  ["theme", "components", "dropdowns", "colors", "bg", "value"],
+    _K("dd_txt"): ["theme", "components", "dropdowns", "colors", "text", "value"],
+    _K("dd_brd"): ["theme", "components", "dropdowns", "colors", "border", "value"],
+    _K("dd_hbg"): ["theme", "components", "dropdowns", "colors", "hover_bg", "value"],
+    # Components - Form Inputs
+    _K("fi_bg"):  ["theme", "components", "forms", "inputs", "colors", "bg", "value"],
+    _K("fi_txt"): ["theme", "components", "forms", "inputs", "colors", "text", "value"],
+    _K("fi_brd"): ["theme", "components", "forms", "inputs", "colors", "border", "value"],
+    _K("fi_ph"):  ["theme", "components", "forms", "inputs", "colors", "placeholder", "value"],
+    # Components - Buttons (Submit)
+    _K("fb_s_bg"):  ["theme", "components", "forms", "buttons", "submit", "colors", "bg", "value"],
+    _K("fb_s_txt"): ["theme", "components", "forms", "buttons", "submit", "colors", "text", "value"],
+    _K("fb_s_brd"): ["theme", "components", "forms", "buttons", "submit", "colors", "border", "value"],
+    # Components - Buttons (Primary)
+    _K("fb_p_bg"):  ["theme", "components", "forms", "buttons", "primary", "colors", "bg", "value"],
+    _K("fb_p_txt"): ["theme", "components", "forms", "buttons", "primary", "colors", "text", "value"],
+    _K("fb_p_brd"): ["theme", "components", "forms", "buttons", "primary", "colors", "border", "value"],
+    # Components - Buttons (Secondary)
+    _K("fb_s2_bg"):  ["theme", "components", "forms", "buttons", "secondary", "colors", "bg", "value"],
+    _K("fb_s2_txt"): ["theme", "components", "forms", "buttons", "secondary", "colors", "text", "value"],
+    _K("fb_s2_brd"): ["theme", "components", "forms", "buttons", "secondary", "colors", "border", "value"],
+    # Components - Buttons (Danger)
+    _K("fb_d_bg"):  ["theme", "components", "forms", "buttons", "danger", "colors", "bg", "value"],
+    _K("fb_d_txt"): ["theme", "components", "forms", "buttons", "danger", "colors", "text", "value"],
+    _K("fb_d_brd"): ["theme", "components", "forms", "buttons", "danger", "colors", "border", "value"],
+    # Components - Headers
+    _K("hd_txt"): ["theme", "components", "headers", "colors", "text", "value"],
+    _K("hd_ulv"): ["theme", "components", "headers", "colors", "underline", "value"],
+    # UI Primitives - Radius Scale
+    _K("r_none"): ["theme", "ui_primitives", "shape", "radius_scale", "none"],
+    _K("r_sm"):   ["theme", "ui_primitives", "shape", "radius_scale", "sm"],
+    _K("r_md"):   ["theme", "ui_primitives", "shape", "radius_scale", "md"],
+    _K("r_lg"):   ["theme", "ui_primitives", "shape", "radius_scale", "lg"],
+    _K("r_xl"):   ["theme", "ui_primitives", "shape", "radius_scale", "xl"],
+    _K("r_pill"): ["theme", "ui_primitives", "shape", "radius_scale", "pill"],
+    # UI Primitives - Default Radius
+    _K("dr_inputs"):  ["theme", "ui_primitives", "shape", "default_radius", "inputs"],
+    _K("dr_buttons"): ["theme", "ui_primitives", "shape", "default_radius", "buttons"],
+    _K("dr_cards"):   ["theme", "ui_primitives", "shape", "default_radius", "cards"],
+    _K("dr_modals"):  ["theme", "ui_primitives", "shape", "default_radius", "modals"],
+    _K("dr_sidebar"): ["theme", "ui_primitives", "shape", "default_radius", "sidebar"],
+    # UI Primitives - Borders
+    _K("bw_thin"):   ["theme", "ui_primitives", "borders", "width", "thin"],
+    _K("bw_thick"):  ["theme", "ui_primitives", "borders", "width", "thick"],
+    _K("fr_width"):  ["theme", "ui_primitives", "borders", "focus_ring", "width_px"],
+    _K("fr_off"):    ["theme", "ui_primitives", "borders", "focus_ring", "offset_px"],
+    _K("fr_style"):  ["theme", "ui_primitives", "borders", "focus_ring", "style"],
+    _K("fr_color"):  ["theme", "ui_primitives", "borders", "focus_ring", "color_mode"],
+    # UI Primitives - Elevation
+    _K("el_none"): ["theme", "ui_primitives", "elevation", "none"],
+    _K("el_sm"):   ["theme", "ui_primitives", "elevation", "sm"],
+    _K("el_md"):   ["theme", "ui_primitives", "elevation", "md"],
+    _K("el_lg"):   ["theme", "ui_primitives", "elevation", "lg"],
+    # UI Primitives - Sizing
+    _K("ih_sm"): ["theme", "ui_primitives", "sizing", "input_heights", "sm"],
+    _K("ih_md"): ["theme", "ui_primitives", "sizing", "input_heights", "md"],
+    _K("ih_lg"): ["theme", "ui_primitives", "sizing", "input_heights", "lg"],
+    _K("bn_sm"): ["theme", "ui_primitives", "sizing", "button_heights", "sm"],
+    _K("bn_md"): ["theme", "ui_primitives", "sizing", "button_heights", "md"],
+    _K("bn_lg"): ["theme", "ui_primitives", "sizing", "button_heights", "lg"],
+    _K("ic_sm"): ["theme", "ui_primitives", "sizing", "icon_sizes", "sm"],
+    _K("ic_md"): ["theme", "ui_primitives", "sizing", "icon_sizes", "md"],
+    _K("ic_lg"): ["theme", "ui_primitives", "sizing", "icon_sizes", "lg"],
+    _K("container_max"): ["theme", "ui_primitives", "sizing", "container_max_width_px"],
+    _K("grid_gutter"):   ["theme", "ui_primitives", "sizing", "grid_gutter_px"],
+    # UI Primitives - Spacing
+    _K("spacing"): ["theme", "ui_primitives", "spacing_scale_px"],
+    # Fonts
+    _K("fg_family"): ["fonts", "global_defaults", "family"],
+    _K("fg_size"):   ["fonts", "global_defaults", "size_px"],
+    _K("fg_weight"): ["fonts", "global_defaults", "weight"],
+    _K("fg_style"):  ["fonts", "global_defaults", "style"],
+    _K("h_inherit"): ["fonts", "headers_and_titles", "inherit_from_global"],
+    _K("h_delta"):   ["fonts", "headers_and_titles", "size_delta_vs_content_px"],
+    _K("h_weight"):  ["fonts", "headers_and_titles", "default_weight"],
+}
+
+
 @require_page("Appearance / Theme")
 def render():
     settings = load_settings()
     engine = get_engine(settings.db.url)
-    init_db(engine)
-    ensure_user_prefs_schema(engine)
+    
     st.session_state["engine"] = engine
 
-    # Use the can_edit_page helper from policy.py for granular control
     roles = user_roles()
     CAN_EDIT = can_edit_page("Appearance / Theme", roles)
     CAN_PUBLISH = "superadmin" in roles
@@ -54,6 +169,49 @@ def render():
     components   = _ensure_path(cfg, ["theme", "components"], {})
     fonts_node   = _ensure_path(cfg, ["fonts"], {})
 
+    # --- FIX ---
+    # Moved _write_cfg here, before it is called by the "Save Profile" button.
+    # It depends on 'ui_primitives', so it must come after that is defined.
+    def _write_cfg(state: str, base_cfg: dict):
+        """
+        Populates the base_cfg dict with values from st.session_state
+        based on the CONFIG_MAP.
+        """
+        def _mv(v): return {"mode": "auto", "value": v}
+        
+        # Get the original spacing values as a fallback
+        default_spacing = ui_primitives.get("spacing_scale_px") or [2,4,6,8,12,16,20,24,32]
+
+        for key, path in CONFIG_MAP.items():
+            if key not in st.session_state:
+                continue
+
+            value = st.session_state[key]
+            final_path = path
+            final_value = value
+            
+            # --- Handle Special Cases ---
+
+            # Case 1: Spacing string needs to be parsed into a list of ints
+            if key == _K("spacing"):
+                try:
+                    parsed = [int(x.strip()) for x in (value or "").split(",") if x.strip().isdigit()]
+                    final_value = parsed or default_spacing # Use default if parsing results in empty list
+                except Exception:
+                    final_value = default_spacing # Fallback on any error
+            
+            # Case 2: Component colors need to be wrapped in the {"mode": ..., "value": ...} dict
+            elif "components" in path and path[-1] == "value":
+                final_path = path[:-1] # Go up one level (e.g., to "background")
+                final_value = _mv(value)
+            
+            # Set the value in the nested dictionary
+            _set_path(base_cfg, final_path, final_value)
+
+        # Finally, set the workflow state
+        _set_path(base_cfg, ["workflow", "publish", "state"], state)
+    # --- END MOVED FUNCTION ---
+
     st.title("🎛️ Appearance / Theme (Slide 6)")
     mode_cfg = {"default_mode": "light", "remember_choice": {"post_login_user_prefs": True}}
     user = st.session_state.get("user") or {}
@@ -69,14 +227,15 @@ def render():
         "High-contrast is per-user. WCAG AA guardrails apply."
     )
 
-    # (The rest of your extensive UI code is preserved and unchanged)
-    #<editor-fold desc="Full UI Rendering Logic">
+    # <editor-fold desc="Full UI Rendering Logic">
     with st.expander("Theme profiles (save / load)", expanded=False):
         cols = st.columns([1, 1, 1, 2])
         with cols[0]:
             prof_name = st.text_input("New profile name", key=_K("prof_name"))
             if st.button("Save current to profile", disabled=(not CAN_EDIT or not prof_name), key=_K("prof_save")):
                 try:
+                    # We need to build the cfg from session state *before* saving
+                    _write_cfg("draft", cfg) # Use "draft" state, it doesn't matter for profile
                     save_profile(engine, prof_name, cfg)
                     st.success(f"Saved profile: {prof_name}")
                 except Exception as ex:
@@ -179,7 +338,14 @@ def render():
     hd_txt = st.color_picker("Header text",      (hd.get("text") or {}).get("value") or "#111111", key=_K("hd_txt"), disabled=READ_ONLY)
     hd_ulv = st.color_picker("Header underline", (hd.get("underline") or {}).get("value") or "#000000", key=_K("hd_ulv"), disabled=READ_ONLY)
 
+    
+    # --- THIS IS THE CORRECTED, USER-FRIENDLY SECTION ---
+    # The old, duplicate block has been removed.
     st.header("UI Primitives")
+    
+    st.subheader("1. Define Corner Roundness (Radius Scale)")
+    st.caption("First, set the pixel (px) size for each 'roundness' name. These names will be used in the next step.")
+    
     radius = _ensure_path(ui_primitives, ["shape", "radius_scale"], {})
     default_radius = _ensure_path(ui_primitives, ["shape", "default_radius"], {})
     borders = _ensure_path(ui_primitives, ["borders"], {})
@@ -188,24 +354,39 @@ def render():
     spacing_vals = ui_primitives.get("spacing_scale_px") or [2,4,6,8,12,16,20,24,32]
 
     c = st.columns(6)
-    with c[0]: r_none = st.number_input("none", 0, 64, int(radius.get("none", 0)), disabled=READ_ONLY)
-    with c[1]: r_sm   = st.number_input("sm",   0, 64, int(radius.get("sm", 2)), disabled=READ_ONLY)
-    with c[2]: r_md   = st.number_input("md",   0, 64, int(radius.get("md", 6)), disabled=READ_ONLY)
-    with c[3]: r_lg   = st.number_input("lg",   0, 64, int(radius.get("lg", 12)), disabled=READ_ONLY)
-    with c[4]: r_xl   = st.number_input("xl",   0, 64, int(radius.get("xl", 20)), disabled=READ_ONLY)
-    with c[5]: r_pill = st.number_input("pill", 0, 9999, int(radius.get("pill", 9999)), disabled=READ_ONLY)
+    
+    with c[0]: r_none = st.number_input("None (0px)", 0, 64, int(radius.get("none", 0)), disabled=READ_ONLY, key=_K("r_none"))
+    with c[1]: r_sm   = st.number_input("Small (sm)",   0, 64, int(radius.get("sm", 2)), disabled=READ_ONLY, key=_K("r_sm"))
+    with c[2]: r_md   = st.number_input("Medium (md)",   0, 64, int(radius.get("md", 6)), disabled=READ_ONLY, key=_K("r_md"))
+    with c[3]: r_lg   = st.number_input("Large (lg)",   0, 64, int(radius.get("lg", 12)), disabled=READ_ONLY, key=_K("r_lg"))
+    with c[4]: r_xl   = st.number_input("Extra-Large (xl)",   0, 64, int(radius.get("xl", 20)), disabled=READ_ONLY, key=_K("r_xl"))
+    with c[5]: r_pill = st.number_input("Pill (Full)", 0, 9999, int(radius.get("pill", 9999)), disabled=READ_ONLY, key=_K("r_pill"))
+
+    st.subheader("2. Apply Roundness to Components")
+    st.caption("Now, choose which 'roundness' name (from Step 1) to apply as the default for each component type.")
+
+    radius_options = ["none", "sm", "md", "lg", "xl", "pill"]
+    
+    def _get_idx(options, value, default_key="md"):
+        """Helper to safely find the index of the saved value."""
+        try: return options.index(value)
+        except ValueError:
+            try: return options.index(default_key)
+            except ValueError: return 0
 
     c = st.columns(5)
-    with c[0]: dr_inputs  = st.selectbox("inputs",  ["sm","md","lg"], index=["sm","md","lg"].index(default_radius.get("inputs","md")), disabled=READ_ONLY)
-    with c[1]: dr_buttons = st.selectbox("buttons", ["sm","md","lg"], index=["sm","md","lg"].index(default_radius.get("buttons","md")), disabled=READ_ONLY)
-    with c[2]: dr_cards   = st.selectbox("cards",   ["sm","md","lg"], index=["sm","md","lg"].index(default_radius.get("cards","md")), disabled=READ_ONLY)
-    with c[3]: dr_modals  = st.selectbox("modals",  ["sm","md","lg"], index=["sm","md","lg"].index(default_radius.get("modals","lg")), disabled=READ_ONLY)
-    with c[4]: dr_sidebar = st.selectbox("sidebar", ["sm","md","lg"], index=["sm","md","lg"].index(default_radius.get("sidebar","lg")), disabled=READ_ONLY)
+    with c[0]: dr_inputs  = st.selectbox("Inputs",  radius_options, index=_get_idx(radius_options, default_radius.get("inputs","md")), disabled=READ_ONLY, key=_K("dr_inputs"))
+    with c[1]: dr_buttons = st.selectbox("Buttons", radius_options, index=_get_idx(radius_options, default_radius.get("buttons","md")), disabled=READ_ONLY, key=_K("dr_buttons"))
+    with c[2]: dr_cards   = st.selectbox("Cards & Tables",   radius_options, index=_get_idx(radius_options, default_radius.get("cards","md")), disabled=READ_ONLY, key=_K("dr_cards"))
+    with c[3]: dr_modals  = st.selectbox("Modals & Popups",  radius_options, index=_get_idx(radius_options, default_radius.get("modals","lg")), disabled=READ_ONLY, key=_K("dr_modals"))
+    with c[4]: dr_sidebar = st.selectbox("Sidebar", radius_options, index=_get_idx(radius_options, default_radius.get("sidebar","lg")), disabled=READ_ONLY, key=_K("dr_sidebar"))
+    # --- END OF CORRECTED SECTION ---
+
 
     c = st.columns(3)
-    with c[0]: bw_thin  = st.number_input("Border thin", 0, 6, int(_ensure_path(borders, ["width"]).get("thin", 1)), disabled=READ_ONLY)
-    with c[1]: bw_thick = st.number_input("Border thick", 0, 6, int(_ensure_path(borders, ["width"]).get("thick", 2)), disabled=READ_ONLY)
-    with c[2]: fr_width = st.number_input("Focus ring width px", 0, 12, int(_ensure_path(borders, ["focus_ring"]).get("width_px", 2)), disabled=READ_ONLY)
+    with c[0]: bw_thin  = st.number_input("Border thin", 0, 6, int(_ensure_path(borders, ["width"]).get("thin", 1)), disabled=READ_ONLY, key=_K("bw_thin"))
+    with c[1]: bw_thick = st.number_input("Border thick", 0, 6, int(_ensure_path(borders, ["width"]).get("thick", 2)), disabled=READ_ONLY, key=_K("bw_thick"))
+    with c[2]: fr_width = st.number_input("Focus ring width px", 0, 12, int(_ensure_path(borders, ["focus_ring"]).get("width_px", 2)), disabled=READ_ONLY, key=_K("fr_width"))
     fr_offset = st.number_input("Focus ring offset px", 0, 12, int(_ensure_path(borders, ["focus_ring"]).get("offset_px", 2)), disabled=READ_ONLY, key=_K("fr_off"))
     fr_style  = st.selectbox("Focus ring style", ["outline","inset"], index=["outline","inset"].index(_ensure_path(borders, ["focus_ring"]).get("style","outline")), disabled=READ_ONLY, key=_K("fr_style"))
     fr_color  = st.selectbox("Focus ring color mode", ["accent","neutral"], index=["accent","neutral"].index(_ensure_path(borders, ["focus_ring"]).get("color_mode","accent")), disabled=READ_ONLY, key=_K("fr_color"))
@@ -238,7 +419,6 @@ def render():
     grid_gutter   = st.number_input("Grid gutter (px)", 0, 64, int(sizing.get("grid_gutter_px", 16)), disabled=READ_ONLY, key=_K("grid_gutter"))
 
     st.subheader("Spacing scale (px)")
-    spacing_vals = ui_primitives.get("spacing_scale_px") or [2,4,6,8,12,16,20,24,32]
     spacing_str = st.text_input("Comma-separated values", ", ".join(str(v) for v in spacing_vals), disabled=READ_ONLY, key=_K("spacing"))
 
     st.header("Fonts")
@@ -260,7 +440,8 @@ def render():
     h_default_weight = st.selectbox("Header default weight", ["bold","normal"],
                                     index=["bold","normal"].index(headers.get("default_weight","bold")),
                                     disabled=READ_ONLY, key=_K("h_weight"))
-
+    # </editor-fold>
+    
     st.markdown("---")
 
     st.header("Live Preview")
@@ -300,8 +481,8 @@ def render():
     col_prev = st.columns([1, 1])
     with col_prev[0]:
         st.markdown("**Buttons**"); st.button("Primary", key=_k("btn_primary")); st.button("Secondary", key=_k("btn_secondary"))
-        st.markdown("**Inputs**"); st.text_input("Example input", "Hello", key=_k("ti_example"))
-        st.markdown("**Select**"); st.selectbox("Example select", ["One", "Two", "Three"], key=_k("sb_example"))
+        st.markdown("**Inputs**"); st.text_input("Example input", "Hello", key=_K("ti_example"))
+        st.markdown("**Select**"); st.selectbox("Example select", ["One", "Two", "Three"], key=_K("sb_example"))
     with col_prev[1]:
         st.markdown("**Headers**"); st.markdown("### Section header"); st.markdown("Body text…")
         st.info("Sidebar styling updates because `components=components` was passed to inject_css. 🎨")
@@ -309,41 +490,14 @@ def render():
 
     st.header("Save / Publish")
 
-    def _mv(v): return {"mode": "auto", "value": v}
-    def _write_cfg(state: str):
-        cfg["theme"].setdefault("tokens", {}).update({
-            "light": {"primary": l_primary, "surface": l_surface, "text": l_text, "muted": l_muted, "accent": l_accent},
-            "dark":  {"primary": d_primary, "surface": d_surface, "text": d_text, "muted": d_muted, "accent": d_accent},
-        })
-        components.setdefault("sidebar", {}).setdefault("colors", {}).update({"background": _mv(sb_bg), "text": _mv(sb_txt), "accent": _mv(sb_acc)})
-        _ensure_path(components, ["tables","colors"], {}).update({"header_bg": _mv(tb_hbg), "header_text": _mv(tb_htx), "row_bg": _mv(tb_rbg), "row_text": _mv(tb_rtx), "border": _mv(tb_br)})
-        _ensure_path(components, ["dropdowns","colors"], {}).update({"bg": _mv(dd_bg), "text": _mv(dd_txt), "border": _mv(dd_brd), "hover_bg": _mv(dd_hbg)})
-        _ensure_path(components, ["forms","inputs","colors"], {}).update({"bg": _mv(fi_bg), "text": _mv(fi_txt), "border": _mv(fi_brd), "placeholder": _mv(fi_ph)})
-        _ensure_path(components, ["forms","buttons","submit","colors"], {}).update({"bg": _mv(fb_s_bg), "text": _mv(fb_s_txt), "border": _mv(fb_s_brd)})
-        _ensure_path(components, ["forms","buttons","primary","colors"], {}).update({"bg": _mv(fb_p_bg), "text": _mv(fb_p_txt), "border": _mv(fb_p_brd)})
-        _ensure_path(components, ["forms","buttons","secondary","colors"], {}).update({"bg": _mv(fb_s2_bg), "text": _mv(fb_s2_txt), "border": _mv(fb_s2_brd)})
-        _ensure_path(components, ["forms","buttons","danger","colors"], {}).update({"bg": _mv(fb_d_bg), "text": _mv(fb_d_txt), "border": _mv(fb_d_brd)})
-        _ensure_path(components, ["headers","colors"], {}).update({"text": _mv(hd_txt), "underline": {"mode": (components.get("headers",{}).get("colors",{}).get("underline",{}) or {}).get("mode","off"), "value": hd_ulv}})
-        _ensure_path(ui_primitives, ["shape","radius_scale"], {}).update({"none": r_none, "sm": r_sm, "md": r_md, "lg": r_lg, "xl": r_xl, "pill": r_pill})
-        _ensure_path(ui_primitives, ["shape","default_radius"], {}).update({"inputs": dr_inputs, "buttons": dr_buttons, "cards": dr_cards, "modals": dr_modals, "sidebar": dr_sidebar})
-        _ensure_path(ui_primitives, ["borders","width"], {}).update({"thin": bw_thin, "thick": bw_thick})
-        _ensure_path(ui_primitives, ["borders","focus_ring"], {}).update({"width_px": fr_width, "offset_px": fr_offset, "style": fr_style, "color_mode": fr_color})
-        ui_primitives["elevation"] = {"none": el_none, "sm": el_sm, "md": el_md, "lg": el_lg}
-        _ensure_path(ui_primitives, ["sizing","input_heights"], {}).update({"sm": ih_sm, "md": ih_md, "lg": ih_lg})
-        _ensure_path(ui_primitives, ["sizing","button_heights"], {}).update({"sm": bn_sm, "md": bn_md, "lg": bn_lg})
-        _ensure_path(ui_primitives, ["sizing","icon_sizes"], {}).update({"sm": icn_sm, "md": icn_md, "lg": icn_lg})
-        ui_primitives["sizing"]["container_max_width_px"] = container_max
-        ui_primitives["sizing"]["grid_gutter_px"] = grid_gutter
-        try: parsed = [int(x.strip()) for x in (spacing_str or "").split(",") if x.strip()]
-        except Exception: parsed = spacing_vals
-        ui_primitives["spacing_scale_px"] = parsed
-        cfg.setdefault("workflow", {}).setdefault("publish", {}).update({"state": state})
+    # The _write_cfg function definition has been moved to the top of render()
+    # to fix the NameError.
 
     col_s1, col_s2 = st.columns(2)
     with col_s1:
         if st.button("💾 Save Draft", disabled=(READ_ONLY or not CAN_EDIT), key=_K("save")):
             try:
-                _write_cfg("draft")
+                _write_cfg("draft", cfg) # Pass the loaded cfg to be modified
                 with engine.begin() as conn:
                     conn.execute(sa_text("INSERT INTO configs(degree, namespace, config_json) VALUES ('default','app_theme', :j) ON CONFLICT(degree, namespace) DO UPDATE SET config_json=excluded.config_json"), {"j": json.dumps(cfg)})
                 st.success("Saved draft.")
@@ -351,7 +505,7 @@ def render():
     with col_s2:
         if st.button("🚀 Publish", disabled=(not CAN_PUBLISH), key=_K("publish")):
             try:
-                _write_cfg("published")
+                _write_cfg("published", cfg) # Pass the loaded cfg to be modified
                 with engine.begin() as conn:
                     conn.execute(sa_text("INSERT INTO configs(degree, namespace, config_json) VALUES ('default','app_theme', :j) ON CONFLICT(degree, namespace) DO UPDATE SET config_json=excluded.config_json"), {"j": json.dumps(cfg)})
                 st.success("Published theme.")

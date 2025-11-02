@@ -11,7 +11,7 @@ from core.settings import load_settings
 
 PAGE_KEY = "Semesters"
 
-#  HELPER FUNCTIONS (to robustly check schema)
+# HELPER FUNCTIONS
 def _table_exists(conn, table_name: str) -> bool:
     row = conn.execute(sa_text(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
@@ -19,9 +19,12 @@ def _table_exists(conn, table_name: str) -> bool:
     return bool(row)
 
 def _has_column(conn, table_name: str, col: str) -> bool:
-    rows = conn.execute(sa_text(f"PRAGMA table_info({table_name})")).fetchall()
-    return any(r[1] == col for r in rows)
-
+    # FIX: Patched SQL injection vulnerability.
+    # Uses parameterized query instead of f-string.
+    row = conn.execute(sa_text(
+        "SELECT 1 FROM pragma_table_info(:table) WHERE name = :col"
+    ), {"table": table_name, "col": col}).fetchone()
+    return bool(row)
 
 def _approvals_columns(conn):
     cols = {r[1] for r in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall()}
@@ -29,7 +32,6 @@ def _approvals_columns(conn):
 
 def _queue_approval(conn, object_type, object_id, action, requester_email, payload: dict):
     cols = _approvals_columns(conn)
-    # Try to include the most complete set your schema supports
     fields = ["object_type","object_id","action","status"]
     values = [":ot",":oid",":ac","'pending'"]
     params = {"ot": object_type, "oid": object_id, "ac": action}
@@ -47,7 +49,6 @@ def _queue_approval(conn, object_type, object_id, action, requester_email, paylo
     conn.execute(sa_text(sql), params)
 
 def _degrees(conn):
-    # Modified to return all degrees with active status
     return conn.execute(sa_text("""
         SELECT code, title, active, cohort_splitting_mode FROM degrees ORDER BY sort_order, code
     """)).fetchall()
@@ -61,38 +62,27 @@ def _programs_for_degree(conn, degree_code):
     """), {"dc": degree_code}).fetchall()
 
 def _branches_for_degree(conn, degree_code):
-    """Fetches branches for a degree, supporting schemas with or without
-    a direct degree_code column on the branches table."""
     if not _table_exists(conn, "branches"):
         return []
 
-    try:
-        # Schema 1: branches table has a direct degree_code link
-        if _has_column(conn, "branches", "degree_code"):
-            return conn.execute(sa_text("""
-                SELECT id, branch_code, branch_name, program_id,
-                       (SELECT program_code FROM programs WHERE id=branches.program_id) as program_code
-                  FROM branches
-                 WHERE lower(degree_code)=lower(:dc)
-                 ORDER BY sort_order, lower(branch_code)
-            """), {"dc": degree_code}).fetchall()
-
-        # Schema 2: branches are linked via programs (branches.program_id -> programs.degree_code)
-        elif _has_column(conn, "branches", "program_id"):
-            return conn.execute(sa_text("""
-                SELECT b.id, b.branch_code, b.branch_name, b.program_id, p.program_code
-                  FROM branches b
-                  JOIN programs p ON p.id = b.program_id
-                 WHERE lower(p.degree_code)=lower(:dc)
-                 ORDER BY b.sort_order, lower(b.branch_code)
-            """), {"dc": degree_code}).fetchall()
-
-        # Fallback if neither schema matches
-        return []
-    except Exception as e:
-        # If there's an error (like table doesn't exist or schema issue), return empty list
-        return []
-
+    # FIX: Removed generic try...except block that was hiding errors.
+    if _has_column(conn, "branches", "degree_code"):
+        return conn.execute(sa_text("""
+            SELECT id, branch_code, branch_name, program_id,
+                   (SELECT program_code FROM programs WHERE id=branches.program_id) as program_code
+              FROM branches
+             WHERE lower(degree_code)=lower(:dc)
+             ORDER BY sort_order, lower(branch_code)
+        """), {"dc": degree_code}).fetchall()
+    elif _has_column(conn, "branches", "program_id"):
+        return conn.execute(sa_text("""
+            SELECT b.id, b.branch_code, b.branch_name, b.program_id, p.program_code
+              FROM branches b
+              JOIN programs p ON p.id = b.program_id
+             WHERE lower(p.degree_code)=lower(:dc)
+             ORDER BY b.sort_order, lower(b.branch_code)
+        """), {"dc": degree_code}).fetchall()
+    return []
 
 def _binding(conn, degree_code):
     return conn.execute(sa_text("""
@@ -163,18 +153,20 @@ def _has_child_semesters(conn, degree_code, target, key):
         """), {"k": key}).fetchone()
         return bool(row)
 
-def _delete_struct(conn, target, key):
-    table = {
-        "degree":  "degree_semester_struct",
-        "program": "program_semester_struct",
-        "branch":  "branch_semester_struct",
-    }[target]
-    keycol = "degree_code" if target == "degree" else f"{target}_id"
-    conn.execute(sa_text(f"DELETE FROM {table} WHERE {keycol}=:k"), {"k": key})
-
-def _rebuild_semesters(conn, degree_code, binding_mode, label_mode):
+# REFACTOR: Function updated to support rebuilding a single target (program/branch)
+# or all semesters for the degree.
+def _rebuild_semesters(conn, degree_code, binding_mode, label_mode, target_id=None):
+    params = {"dc": degree_code}
+    
     # clear existing for degree
-    conn.execute(sa_text("DELETE FROM semesters WHERE degree_code=:dc"), {"dc": degree_code})
+    if binding_mode == "program" and target_id:
+        conn.execute(sa_text("DELETE FROM semesters WHERE program_id=:tid"), {"tid": target_id})
+    elif binding_mode == "branch" and target_id:
+        conn.execute(sa_text("DELETE FROM semesters WHERE branch_id=:tid"), {"tid": target_id})
+    elif binding_mode == "degree" and target_id: # target_id will be degree_code
+        conn.execute(sa_text("DELETE FROM semesters WHERE degree_code=:dc AND program_id IS NULL AND branch_id IS NULL"), {"dc": degree_code})
+    elif not target_id: # "Rebuild All" quick action
+        conn.execute(sa_text("DELETE FROM semesters WHERE degree_code=:dc"), {"dc": degree_code})
 
     def label(y, t, n):
         if label_mode == "year_term":
@@ -200,12 +192,17 @@ def _rebuild_semesters(conn, degree_code, binding_mode, label_mode):
         return n
 
     if binding_mode == "program":
-        prows = conn.execute(sa_text("""
+        sql = """
             SELECT p.id, s.years, s.terms_per_year
               FROM programs p
          LEFT JOIN program_semester_struct s ON s.program_id=p.id
              WHERE lower(p.degree_code)=lower(:dc)
-        """), {"dc": degree_code}).fetchall()
+        """
+        if target_id:
+            sql += " AND p.id = :tid"
+            params["tid"] = target_id
+            
+        prows = conn.execute(sa_text(sql), params).fetchall()
         total = 0
         for pid, years, tpy in prows:
             if years is None or tpy is None:
@@ -230,7 +227,7 @@ def _rebuild_semesters(conn, degree_code, binding_mode, label_mode):
              LEFT JOIN branch_semester_struct s ON s.branch_id=b.id
                  WHERE lower(b.degree_code)=lower(:dc)
             """
-        else: # Fallback to joining through programs
+        else:
             sql = """
                 SELECT b.id, s.years, s.terms_per_year
                   FROM branches b
@@ -238,7 +235,12 @@ def _rebuild_semesters(conn, degree_code, binding_mode, label_mode):
              LEFT JOIN branch_semester_struct s ON s.branch_id=b.id
                  WHERE lower(p.degree_code)=lower(:dc)
             """
-        brows = conn.execute(sa_text(sql), {"dc": degree_code}).fetchall()
+        
+        if target_id:
+            sql += " AND b.id = :tid"
+            params["tid"] = target_id
+            
+        brows = conn.execute(sa_text(sql), params).fetchall()
         
         total = 0
         for bid, years, tpy in brows:
@@ -255,25 +257,7 @@ def _rebuild_semesters(conn, degree_code, binding_mode, label_mode):
                     """), {"dc": degree_code, "bid": bid, "y": y, "t": t, "n": n, "lbl": label(y,t,n)})
         return total
 
-# NEW helpers for the map
-def _curriculum_groups_df(conn, degree_filter: str):
-    rows = conn.execute(sa_text("""
-        SELECT id, group_code, group_name
-          FROM curriculum_groups
-         WHERE degree_code=:d
-         ORDER BY sort_order, group_code
-    """), {"d": degree_filter}).fetchall()
-    return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
-
-def _curriculum_group_links_df(conn, degree_filter: str):
-    rows = conn.execute(sa_text("""
-        SELECT cgl.id, cg.group_code, cgl.program_code, cgl.branch_code
-          FROM curriculum_group_links cgl
-          JOIN curriculum_groups cg ON cg.id = cgl.group_id
-         WHERE cgl.degree_code = :d
-    """), {"d": degree_filter}).fetchall()
-    return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
-
+# Structure helpers
 def _get_degree_struct(conn, degree_code: str) -> tuple | None:
     row = conn.execute(sa_text("SELECT years, terms_per_year FROM degree_semester_struct WHERE degree_code=:k"), {"k": degree_code}).fetchone()
     return (row.years, row.terms_per_year) if row else None
@@ -301,18 +285,45 @@ def _get_branch_structs_for_degree(conn, degree_code: str) -> dict:
     rows = conn.execute(sa_text(q), {"dc": degree_code}).fetchall()
     return {r.branch_code: (r.years, r.terms_per_year) for r in rows}
 
+# Approval helpers
+def _get_pending_approvals(conn, degree_code: str) -> list:
+    rows = conn.execute(sa_text("""
+        SELECT id, object_type, object_id, action, status, requester, created_at, payload
+        FROM approvals 
+        WHERE (object_id LIKE :degree_pattern OR object_id = :degree_code)
+          AND status IN ('pending', 'under_review')
+        ORDER BY created_at DESC
+    """), {"degree_pattern": f"%{degree_code}%", "degree_code": degree_code}).fetchall()
+    
+    results = []
+    for r in rows:
+        d = dict(r._mapping)
+        try:
+            d['payload'] = json.loads(d.get('payload', '{}'))
+        except (json.JSONDecodeError, TypeError):
+            d['payload'] = {}
+        results.append(d)
+    return results
+
+def _get_approved_changes(conn, degree_code: str) -> list:
+    rows = conn.execute(sa_text("""
+        SELECT id, object_type, object_id, action, status, requester, approver, decided_at
+        FROM approvals 
+        WHERE (object_id LIKE :degree_pattern OR object_id = :degree_code)
+          AND status = 'approved'
+          AND decided_at >= datetime('now', '-1 day')
+        ORDER BY decided_at DESC
+    """), {"degree_pattern": f"%{degree_code}%", "degree_code": degree_code}).fetchall()
+    return [dict(r._mapping) for r in rows]
 
 @require_page(PAGE_KEY)
 def render():
     settings = load_settings()
     engine = get_engine(settings.db.url)
-    
     init_db(engine)
 
-    
-
     st.title("Semesters / Terms")
-    st.caption("Curriculum groups do not affect semesters.")
+    st.caption("Configure semester structure for degrees, programs, and branches")
 
     with engine.begin() as conn:
         degs = _degrees(conn)
@@ -324,204 +335,232 @@ def render():
     degree_options = []
     deg_map = {f"{d.code} — {d.title}{' (Active)' if d.active else ' (Inactive)'}": (d.code, d.cohort_splitting_mode, d.title) for d in degs}
     
-    deg_label = st.selectbox("Degree", options=list(deg_map.keys()), key="sem_deg_sel")
-    
+    deg_label = st.selectbox("Select Degree", options=list(deg_map.keys()), key="sem_deg_sel")
     degree_code, cohort_mode, degree_title = deg_map[deg_label]
     mode = str(cohort_mode or "both").lower()
 
-    # NEW: Fetch all data for the map at the top
+    # Get current state
     with engine.begin() as conn:
-        dfp = pd.DataFrame(_programs_for_degree(conn, degree_code))
-        dfb_all = pd.DataFrame(_branches_for_degree(conn, degree_code))
-        df_cg = _curriculum_groups_df(conn, degree_code)
-        df_cgl = _curriculum_group_links_df(conn, degree_code)
+        binding_row = _binding(conn, degree_code)
+        # Initialize binding if not exists
+        if not binding_row:
+            _set_binding(conn, degree_code, "degree", "year_term")
+            binding_row = _binding(conn, degree_code)
+            
+        pending_approvals = _get_pending_approvals(conn, degree_code)
+        approved_changes = _get_approved_changes(conn, degree_code)
         
-        binding_mode = _binding(conn, degree_code)
-        sem_binding = binding_mode[0] if binding_mode else 'degree'
+        programs = _programs_for_degree(conn, degree_code)
+        branches = _branches_for_degree(conn, degree_code)
         
         deg_struct = _get_degree_struct(conn, degree_code)
         prog_structs = _get_program_structs_for_degree(conn, degree_code)
         branch_structs = _get_branch_structs_for_degree(conn, degree_code)
+    
+    current_binding = binding_row[0] if binding_row else 'degree'
+    current_label_mode = binding_row[1] if binding_row else 'year_term'
 
-    # NEW: Degree Map from programs_branches.py, adapted for this page
-    with st.expander("Show full degree structure map", expanded=False):
+    # UI FIX: Check for pending binding change to lock config
+    pending_binding_change = next((p for p in pending_approvals if p['action'] == 'binding_change'), None)
+    config_locked = bool(pending_binding_change)
+
+    # Show approval status
+    if pending_approvals:
+        with st.expander("🕒 Pending Approvals", expanded=True):
+            for approval in pending_approvals:
+                st.warning(
+                    f"**{approval['object_type']}.{approval['action']}** - "
+                    f"Object: `{approval['object_id']}` - "
+                    f"Requested by: `{approval['requester']}` - "
+                    f"Status: `{approval['status']}`"
+                )
+    
+    if approved_changes:
+        with st.expander("✅ Recently Approved Changes", expanded=True):
+            for approval in approved_changes:
+                st.success(
+                    f"**{approval['object_type']}.{approval['action']}** - "
+                    f"Object: `{approval['object_id']}` - "
+                    f"Approved by: `{approval['approver']}` - "
+                    f"Ready for use"
+                )
+
+    # Degree Structure Overview
+    st.subheader("📊 Degree Structure Overview")
+    with st.expander("View Degree Hierarchy", expanded=True):
         map_md = f"**Degree:** {degree_title} (`{degree_code}`)\n"
-        if sem_binding == 'degree' and deg_struct:
-            map_md += f"- *Semester Structure: {deg_struct[0]} Years, {deg_struct[1]} Terms/Year*\n"
+        map_md += f"- **Hierarchy Mode:** {mode.upper()}\n"
+        map_md += f"- **Current Binding:** {current_binding.upper()}\n"
+        
+        if current_binding == 'degree' and deg_struct:
+            map_md += f"- *Degree Structure: {deg_struct[0]} Years, {deg_struct[1]} Terms/Year*\n"
         map_md += "\n"
 
         if mode == 'both':
-            map_md += "**Hierarchy:** `Degree → Program → Branch`\n"
-            if not dfp.empty:
-                for _, prog_row in dfp.iterrows():
-                    prog_code = prog_row['program_code']
-                    map_md += f"- **Program:** {prog_row['program_name']} (`{prog_code}`)\n"
-                    if sem_binding == 'program' and prog_code in prog_structs:
-                        p_struct = prog_structs[prog_code]
-                        map_md += f"  - *Semester Structure: {p_struct[0]} Years, {p_struct[1]} Terms/Year*\n"
+            map_md += "**Structure:** `Degree → Program → Branch`\n"
+            if programs:
+                map_md += f"\n**Programs ({len(programs)}):**\n"
+                for pid, pcode, pname in programs:
+                    map_md += f"- **{pname}** (`{pcode}`)\n"
+                    if current_binding == 'program' and pcode in prog_structs:
+                        p_struct = prog_structs[pcode]
+                        map_md += f"  - *Structure: {p_struct[0]} Years, {p_struct[1]} Terms/Year*\n"
                     
-                    linked_cgs_prog = df_cgl[df_cgl['program_code'] == prog_code] if not df_cgl.empty else pd.DataFrame()
-                    for _, cg_link_row in linked_cgs_prog.iterrows():
-                        map_md += f"  - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
-
-                    child_branches = dfb_all[dfb_all['program_code'] == prog_code] if not dfb_all.empty else pd.DataFrame()
-                    if not child_branches.empty:
-                        for _, branch_row in child_branches.iterrows():
-                            branch_code = branch_row['branch_code']
-                            map_md += f"  - **Branch:** {branch_row['branch_name']} (`{branch_code}`)\n"
-                            if sem_binding == 'branch' and branch_code in branch_structs:
-                                b_struct = branch_structs[branch_code]
-                                map_md += f"    - *Semester Structure: {b_struct[0]} Years, {b_struct[1]} Terms/Year*\n"
-                            
-                            linked_cgs_branch = df_cgl[df_cgl['branch_code'] == branch_code] if not df_cgl.empty else pd.DataFrame()
-                            for _, cg_link_row in linked_cgs_branch.iterrows():
-                                map_md += f"    - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
+                    program_branches = [b for b in branches if b[3] == pid]  # branches for this program
+                    if program_branches:
+                        map_md += f"  - **Branches ({len(program_branches)}):**\n"
+                        for bid, bcode, bname, _, _ in program_branches:
+                            map_md += f"    - {bname} (`{bcode}`)\n"
+                            if current_binding == 'branch' and bcode in branch_structs:
+                                b_struct = branch_structs[bcode]
+                                map_md += f"      - *Structure: {b_struct[0]} Years, {b_struct[1]} Terms/Year*\n"
                     else:
-                        map_md += "  - *(No branches defined for this program)*\n"
+                        map_md += "  - *No branches*\n"
             else:
-                map_md += "*(No programs defined for this degree)*\n"
+                map_md += "*(No programs defined)*\n"
 
         elif mode == 'program_or_branch':
-            map_md += "**Hierarchy:** `Degree → Program/Branch` (Independent)\n"
-            if not dfp.empty:
-                map_md += "**Programs:**\n"
-                for _, prog_row in dfp.iterrows():
-                    prog_code = prog_row['program_code']
-                    map_md += f"- {prog_row['program_name']} (`{prog_code}`)\n"
-                    linked_cgs_prog = df_cgl[df_cgl['program_code'] == prog_code] if not df_cgl.empty else pd.DataFrame()
-                    for _, cg_link_row in linked_cgs_prog.iterrows():
-                        map_md += f"  - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
+            map_md += "**Structure:** `Degree → Program/Branch` (Independent)\n"
+            if programs:
+                map_md += f"\n**Programs ({len(programs)}):**\n"
+                for _, pcode, pname in programs:
+                    map_md += f"- {pname} (`{pcode}`)\n"
             else:
                 map_md += "**Programs:** None\n"
 
-            if not dfb_all.empty:
-                map_md += "\n**Branches:**\n"
-                for _, branch_row in dfb_all.iterrows():
-                    branch_code = branch_row['branch_code']
-                    parent_prog = branch_row.get('program_code')
-                    if parent_prog:
-                        map_md += f"- {branch_row['branch_name']} (`{branch_code}`) *(under Program: {parent_prog})*\n"
-                    else:
-                        map_md += f"- {branch_row['branch_name']} (`{branch_code}`) *(direct to Degree)*\n"
-                    
-                    linked_cgs_branch = df_cgl[df_cgl['branch_code'] == branch_code] if not df_cgl.empty else pd.DataFrame()
-                    for _, cg_link_row in linked_cgs_branch.iterrows():
-                        map_md += f"  - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
+            if branches:
+                map_md += f"\n**Branches ({len(branches)}):**\n"
+                for _, bcode, bname, _, pcode in branches:
+                    parent_info = f"(under {pcode})" if pcode else "(direct)"
+                    map_md += f"- {bname} (`{bcode}`) {parent_info}\n"
             else:
                 map_md += "\n**Branches:** None\n"
         
         elif mode == 'program_only':
-            map_md += "**Hierarchy:** `Degree → Program`\n"
-            if not dfp.empty:
-                map_md += "**Programs:**\n"
-                for _, prog_row in dfp.iterrows():
-                    prog_code = prog_row['program_code']
-                    map_md += f"- {prog_row['program_name']} (`{prog_code}`)\n"
-                    linked_cgs_prog = df_cgl[df_cgl['program_code'] == prog_code] if not df_cgl.empty else pd.DataFrame()
-                    for _, cg_link_row in linked_cgs_prog.iterrows():
-                        map_md += f"  - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
+            map_md += "**Structure:** `Degree → Program`\n"
+            if programs:
+                map_md += f"\n**Programs ({len(programs)}):**\n"
+                for _, pcode, pname in programs:
+                    map_md += f"- {pname} (`{pcode}`)\n"
             else:
                 map_md += "**Programs:** None\n"
-            map_md += "\n**Branches:** *Not applicable in this mode.*\n"
+            map_md += "\n**Branches:** *Not applicable in this mode*\n"
 
         elif mode == 'branch_only':
-            map_md += "**Hierarchy:** `Degree → Branch`\n"
-            map_md += "**Programs:** *Not applicable in this mode.*\n"
-            if not dfb_all.empty:
-                map_md += "\n**Branches:**\n"
-                for _, branch_row in dfb_all.iterrows():
-                    branch_code = branch_row['branch_code']
-                    map_md += f"- {branch_row['branch_name']} (`{branch_code}`)\n"
-                    linked_cgs_branch = df_cgl[df_cgl['branch_code'] == branch_code] if not df_cgl.empty else pd.DataFrame()
-                    for _, cg_link_row in linked_cgs_branch.iterrows():
-                        map_md += f"  - *Curriculum Group:* `{cg_link_row['group_code']}`\n"
+            map_md += "**Structure:** `Degree → Branch`\n"
+            map_md += "**Programs:** *Not applicable in this mode*\n"
+            if branches:
+                map_md += f"\n**Branches ({len(branches)}):**\n"
+                for _, bcode, bname, _, _ in branches:
+                    map_md += f"- {bname} (`{bcode}`)\n"
             else:
                 map_md += "\n**Branches:** None\n"
 
         elif mode == 'none':
-            map_md += "**Hierarchy:** `Degree Only`\n"
-            map_md += "**Programs:** *Not applicable in this mode.*\n"
-            map_md += "**Branches:** *Not applicable in this mode.*\n"
+            map_md += "**Structure:** `Degree Only`\n"
+            map_md += "**Programs:** *Not applicable in this mode*\n"
+            map_md += "**Branches:** *Not applicable in this mode*\n"
 
-        map_md += "\n---\n"
-        cg_list = df_cg["group_name"].tolist() if not df_cg.empty else []
-        map_md += f"**All Defined Curriculum Groups (for this degree):** {', '.join(cg_list) if cg_list else 'None'}"
-        
         st.markdown(map_md)
-    st.markdown("---")
 
+    st.markdown("---")
 
     user = st.session_state.get("user") or {}
     roles = set(user.get("roles") or [])
     actor = user.get("email") or "system"
-
-    can_edit = bool(roles.intersection({"superadmin","principal","director"}))
+    
+    # BUG FIX: Use policy function for edit rights, not hardcoded roles
+    can_edit = can_edit_page(PAGE_KEY, roles)
+    
+    # Keep page-specific logic for a "view-only" mode
     mr_view_only = ("management_representative" in roles) and not can_edit
 
-    # Binding + label mode
-    with engine.begin() as conn:
-        row = _binding(conn, degree_code)
-    current_binding = (row[0] if row else None)
-    current_label_mode = (row[1] if row else "year_term")
-
-    st.subheader("Binding")
+    # Binding Configuration
+    st.subheader("⚙️ Binding Configuration")
     
-    with engine.begin() as conn:
-        has_prog = bool(_programs_for_degree(conn, degree_code))
-        # FIXED: Use robust helper function to check for branches
-        has_branch = bool(_branches_for_degree(conn, degree_code))
+    if config_locked:
+        st.warning(f"**Binding change to '{pending_binding_change['payload']['to'].upper()}' is pending approval.**")
+        st.info("Configuration is locked until this change is approved or rejected.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Current Binding", current_binding.upper())
+    with col2:
+        st.metric("Label Format", "Year/Term" if current_label_mode == "year_term" else "Semester")
 
-    binding_options = ["degree","program","branch"]
-    if not (has_prog or has_branch):
-        binding_options = ["degree"]
+    # Determine available binding options
+    binding_options = ["degree"]
+    if programs:
+        binding_options.append("program")
+    if branches:
+        binding_options.append("branch")
 
-    bcol1, bcol2 = st.columns([1,1])
-    with bcol1:
-        sel_binding = st.radio("Binding mode", binding_options,
-                               index=(binding_options.index(current_binding) if current_binding in binding_options else 0),
-                               horizontal=True,
-                               key=f"sem_bind_{degree_code}",
-                               disabled=(mr_view_only))
-    with bcol2:
-        sel_label = st.radio("Label mode", ["year_term","semester_n"],
-                             index=(0 if current_label_mode=="year_term" else 1),
-                             horizontal=True,
-                             key=f"sem_label_{degree_code}",
-                             disabled=(mr_view_only))
+    st.info(f"**Available binding levels:** {', '.join([b.upper() for b in binding_options])}")
 
-    # Handle binding / label changes
-    if (sel_binding != current_binding or sel_label != current_label_mode):
-        if not can_edit or mr_view_only:
-            st.warning("You do not have permission to change binding or labels.")
-        else:
-            if sel_binding != current_binding and current_binding is not None:
-                with engine.begin() as conn:
-                    _queue_approval(conn, "semesters", degree_code, "binding_change",
-                                    requester_email=actor,
-                                    payload={"from": current_binding, "to": sel_binding, "auto_rebuild": True})
-                st.info("Binding change submitted for approval.")
-                st.stop()
-            else:
-                with engine.begin() as conn:
-                    _set_binding(conn, degree_code, sel_binding, sel_label)
-                    conn.execute(sa_text("""
-                        INSERT INTO semesters_audit(action, actor, degree_code, payload)
-                        VALUES('edit', :actor, :dc, :pl)
-                    """), {"actor": actor, "dc": degree_code,
-                           "pl": json.dumps({"label_mode": sel_label})})
-                st.success("Label mode updated.")
-                st.rerun()
+    # UI FIX: User-friendly labels for Binding Level
+    binding_format_options = {
+        "degree": "Degree",
+        "program": "Program",
+        "branch": "Branch"
+    }
+    
+    new_binding = st.radio("Select Semester Binding Level:", 
+                          options=binding_options, # This is the list like ['degree', 'program']
+                          index=binding_options.index(current_binding) if current_binding in binding_options else 0,
+                          format_func=lambda k: binding_format_options.get(k, k.capitalize()), # Map to friendly label
+                          horizontal=True,
+                          # UI FIX: Disable if config is locked
+                          disabled=(config_locked or mr_view_only or not can_edit),
+                          help="Choose at which level semesters should be configured")
 
-    if not current_binding:
-        with engine.begin() as conn:
-            _set_binding(conn, degree_code, sel_binding, sel_label)
-        current_binding = sel_binding
-        current_label_mode = sel_label
+    # FIX: This 'if' statement must be on its own line and dedented
+    if new_binding != current_binding:
+        if st.button("🔄 Change Binding Level", 
+                    type="primary",
+                    disabled=(config_locked or mr_view_only or not can_edit)):
+            with engine.begin() as conn:
+                _queue_approval(conn, "semesters", degree_code, "binding_change",
+                              requester_email=actor,
+                              payload={
+                                  "from": current_binding, 
+                                  "to": new_binding, 
+                                  "auto_rebuild": True,
+                                  "note": f"Change semester binding from {current_binding} to {new_binding}"
+                              })
+            st.success(f"Binding change to '{new_binding.upper()}' submitted for approval.")
+            st.info("After approval, you'll be able to configure semesters at the selected level.")
+            # Original code already correctly used st.stop() here.
+            st.stop()
 
-    st.divider()
-    st.subheader("Structure")
+    # Label mode (immediate change)
+    # UI FIX: User-friendly labels for Semester Label Format
+    label_format_options = {
+        "year_term": "Year / Term",
+        "semester_n": "Semester Number"
+    }
+    label_options_keys = list(label_format_options.keys()) # ['year_term', 'semester_n']
+    
+    new_label = st.radio("Semester Label Format:", 
+                        options=label_options_keys,
+                        index=label_options_keys.index(current_label_mode),
+                        format_func=lambda k: label_format_options[k], # This displays the friendly labels
+                        horizontal=True,
+                        disabled=(config_locked or mr_view_only or not can_edit),
+                        help="Choose how semesters are labeled")
 
-    def _structure_editor(target, key, title):
+    if new_label != current_label_mode:
+        if st.button("Update Label Format", 
+                    # UI FIX: Disable if config is locked
+                    disabled=(config_locked or mr_view_only or not can_edit)):
+            with engine.begin() as conn:
+                _set_binding(conn, degree_code, current_binding, new_label)
+            st.success("Label format updated.")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("🎯 Semester Structure Configuration")
+
+    def _structure_editor(target, key, title, code):
         with engine.begin() as conn:
             srow = _struct_for_target(conn, target, key)
             have_semesters = _has_child_semesters(conn, degree_code, target, key)
@@ -529,91 +568,192 @@ def render():
         years_val = int(srow[0]) if srow else 4
         tpy_val = int(srow[1]) if srow else 2
 
-        c1, c2, c3 = st.columns([1,1,2])
-        with c1:
-            y = st.number_input(f"{title}: Years", 1, 10, years_val, step=1,
+        st.write(f"**{title}** (`{code}`)")
+        col1, col2, col3 = st.columns([1,1,2])
+        with col1:
+            y = st.number_input(f"Years", 1, 10, years_val, step=1,
                                 key=f"yrs_{target}_{key}")
-        with c2:
-            t = st.number_input(f"{title}: Terms/Year", 1, 5, tpy_val, step=1,
+        with col2:
+            t = st.number_input(f"Terms/Year", 1, 5, tpy_val, step=1,
                                 key=f"tpy_{target}_{key}")
-        with c3:
-            st.write("")
+        with col3:
+            status_text = "⚠️ Has existing semesters" if have_semesters else "✅ No existing semesters"
+            st.write(status_text)
 
         save_disabled = (mr_view_only or not can_edit)
-        if st.button(f"Save {title}", key=f"save_{target}_{key}", disabled=save_disabled):
-            if have_semesters and (int(y) != years_val or int(t) != tpy_val):
-                with engine.begin() as conn:
-                    _queue_approval(conn, "semesters", f"{target}:{key}", "edit_structure",
-                                    requester_email=actor,
-                                    payload={"years_from": years_val, "tpy_from": tpy_val,
-                                             "years_to": int(y), "tpy_to": int(t),
-                                             "reason": "Edit years/terms requires approval when child data exists"})
-                st.info("Edit submitted for approval (child data detected).")
-            else:
-                with engine.begin() as conn:
-                    _upsert_struct(conn, target, key, int(y), int(t))
-                    conn.execute(sa_text("""
-                        INSERT INTO semesters_audit(action, actor, degree_code, payload)
-                        VALUES('edit', :actor, :dc, :pl)
-                    """), {"actor": actor, "dc": degree_code,
-                           "pl": json.dumps({"target": target, "key": key, "years": int(y), "tpy": int(t)})})
-                st.success("Saved.")
-            st.rerun()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button(f"💾 Save Structure", 
+                        key=f"save_{target}_{key}", 
+                        disabled=save_disabled,
+                        use_container_width=True):
+                if have_semesters and (int(y) != years_val or int(t) != tpy_val):
+                    with engine.begin() as conn:
+                        _queue_approval(conn, "semesters", f"{target}:{key}", "edit_structure",
+                                      requester_email=actor,
+                                      payload={
+                                          "years_from": years_val, 
+                                          "tpy_from": tpy_val,
+                                          "years_to": int(y), 
+                                          "tpy_to": int(t),
+                                          "reason": "Edit years/terms requires approval when child data exists"
+                                      })
+                    st.info("Structure change submitted for approval (existing semesters detected).")
+                    # UI FIX: Use st.stop() instead of st.rerun() to keep inputs
+                    st.stop()
+                else:
+                    with engine.begin() as conn:
+                        _upsert_struct(conn, target, key, int(y), int(t))
+                    st.success("Structure saved.")
+                    st.rerun()
 
-        if st.button(f"Rebuild {title} semesters", key=f"rebuild_{target}_{key}",
-                     disabled=(mr_view_only or not can_edit)):
-            with engine.begin() as conn:
-                cnt = _rebuild_semesters(conn, degree_code, current_binding, current_label_mode)
-                conn.execute(sa_text("""
-                    INSERT INTO semesters_audit(action, actor, degree_code, payload)
-                    VALUES('rebuild', :actor, :dc, :pl)
-                """), {"actor": actor, "dc": degree_code,
-                       "pl": json.dumps({"target": target, "key": key, "count": cnt})})
-            st.success("Rebuilt.")
-            st.rerun()
+        with col2:
+            # BUG FIX: Rebuild button now checks for approval
+            if st.button(f"🔄 Rebuild Semesters", 
+                        key=f"rebuild_{target}_{key}",
+                        disabled=(mr_view_only or not can_edit),
+                        use_container_width=True):
+                if have_semesters:
+                    with engine.begin() as conn:
+                        _queue_approval(conn, "semesters", f"{target}:{key}", "rebuild_semesters",
+                                      requester_email=actor,
+                                      payload={
+                                          "note": f"Request to rebuild semesters for {target} {key}",
+                                          "binding_mode": current_binding,
+                                          "label_mode": current_label_mode,
+                                          "target_id": key
+                                      })
+                    st.info("Rebuild request submitted for approval (existing semesters detected).")
+                    st.stop()
+                else:
+                    with engine.begin() as conn:
+                        # UI FIX: Pass target_id to only rebuild this item
+                        cnt = _rebuild_semesters(conn, degree_code, current_binding, current_label_mode, target_id=key)
+                    st.success(f"Rebuilt {cnt} semesters.")
+                    st.rerun()
 
-        st.caption("Note: Delete of structure always requires approval.")
-
-    if current_binding == "degree":
-        _structure_editor("degree", degree_code, f"Degree {degree_code}")
+    # Show appropriate structure editor based on current binding
+    # UI FIX: Check if config is locked
+    if config_locked:
+        st.info("Semester structure configuration is locked due to a pending binding change.")
+    elif current_binding == "degree":
+        _structure_editor("degree", degree_code, "Degree Structure", degree_code)
 
     elif current_binding == "program":
-        with engine.begin() as conn:
-            prows = _programs_for_degree(conn, degree_code)
-        if not prows:
-            st.info("No programs under this degree.")
+        if not programs:
+            st.info("No programs found for this degree. Please create programs first.")
         else:
-            labels = {f"{pcode} — {pname}": pid for (pid, pcode, pname) in prows}
-            sel = st.selectbox("Program", list(labels.keys()), key=f"sem_prog_{degree_code}")
-            _structure_editor("program", labels[sel], f"Program {sel.split(' — ')[0]}")
+            program_options = [f"{pcode} — {pname}" for (_, pcode, pname) in programs]
+            selected_program = st.selectbox("Select Program to Configure:", 
+                                          program_options,
+                                          key=f"sem_prog_{degree_code}")
+            
+            selected_program_id = next(pid for (pid, pcode, pname) in programs if f"{pcode} — {pname}" == selected_program)
+            selected_program_code = next(pcode for (pid, pcode, pname) in programs if f"{pcode} — {pname}" == selected_program)
+            
+            _structure_editor("program", selected_program_id, "Program Structure", selected_program_code)
 
     elif current_binding == "branch":
-        with engine.begin() as conn:
-            brows = _branches_for_degree(conn, degree_code)
-        if not brows:
-            st.info("No branches under this degree.")
+        if not branches:
+            st.info("No branches found for this degree. Please create branches first.")
         else:
-            def _fmt(br):
-                bid, bcode, bname, pid, pcode = br
-                code = bcode or f"#{bid}"
-                return f"{code} — {bname or 'Branch'}"
-            labels = {_fmt(b): b[0] for b in brows}
-            sel = st.selectbox("Branch", list(labels.keys()), key=f"sem_branch_{degree_code}")
-            _structure_editor("branch", labels[sel], f"Branch {sel.split(' — ')[0]}")
+            branch_options = [f"{bcode} — {bname}" for (_, bcode, bname, _, _) in branches]
+            selected_branch = st.selectbox("Select Branch to Configure:", 
+                                         branch_options,
+                                         key=f"sem_branch_{degree_code}")
+            
+            selected_branch_id = next(bid for (bid, bcode, bname, _, _) in branches if f"{bcode} — {bname}" == selected_branch)
+            selected_branch_code = next(bcode for (bid, bcode, bname, _, _) in branches if f"{bcode} — {bname}" == selected_branch)
+            
+            _structure_editor("branch", selected_branch_id, "Branch Structure", selected_branch_code)
 
-    st.divider()
-    st.subheader("Current Semesters (flat)")
+    st.markdown("---")
+    st.subheader("📋 Current Semesters")
 
     with engine.begin() as conn:
-        rows = conn.execute(sa_text("""
+        df_rows = conn.execute(sa_text("""
             SELECT degree_code, program_id, branch_id, year_index, term_index, semester_number, label, active, updated_at
               FROM semesters
              WHERE lower(degree_code)=lower(:dc)
              ORDER BY program_id NULLS FIRST, branch_id NULLS FIRST, year_index, term_index
         """), {"dc": degree_code}).fetchall()
-    if rows:
-        df = pd.DataFrame(rows, columns=["degree","program_id","branch_id","year","term","sem_no","label","active","updated"])
+    
+    semesters_exist = bool(df_rows)
+    
+    if semesters_exist:
+        df = pd.DataFrame(df_rows, columns=["degree","program_id","branch_id","year","term","sem_no","label","active","updated"])
         st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(f"Total semesters: {len(df_rows)}")
+        
+        # Show semester statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Semesters", len(df_rows))
+        with col2:
+            active_count = len([r for r in df_rows if r[7] == 1])
+            st.metric("Active Semesters", active_count)
+        with col3:
+            unique_years = len(set(r[3] for r in df_rows))
+            st.metric("Years Covered", unique_years)
     else:
-        st.info("No semesters yet. Save structure and rebuild.")
+        st.info("No semesters found. Configure the structure above and rebuild semesters.")
+
+    # Quick Actions
+    st.markdown("---")
+    st.subheader("⚡ Quick Actions")
+    
+    col1, col2, col3 = st.columns(3)
+    quick_actions_disabled = (mr_view_only or not can_edit)
+    
+    with col1:
+        # BUG FIX: Add approval check and permission check
+        if st.button("🗑️ Clear All Semesters", 
+                    type="secondary", 
+                    use_container_width=True,
+                    disabled=quick_actions_disabled):
+            if semesters_exist:
+                with engine.begin() as conn:
+                    _queue_approval(conn, "semesters", degree_code, "clear_all_semesters",
+                                  requester_email=actor,
+                                  payload={"note": "Request to clear all semesters for degree."})
+                st.info("Request to clear all semesters submitted for approval.")
+                st.stop()
+            else:
+                with engine.begin() as conn:
+                    conn.execute(sa_text("DELETE FROM semesters WHERE degree_code=:dc"), {"dc": degree_code})
+                st.success("All semesters cleared (no existing semesters).")
+                st.rerun()
+    
+    with col2:
+        # BUG FIX: Add approval check and permission check
+        if st.button("🔄 Rebuild All Semesters", 
+                    type="primary", 
+                    use_container_width=True,
+                    disabled=quick_actions_disabled):
+            if semesters_exist:
+                with engine.begin() as conn:
+                    _queue_approval(conn, "semesters", degree_code, "rebuild_all_semesters",
+                                  requester_email=actor,
+                                  payload={
+                                      "note": "Request to rebuild all semesters for degree.",
+                                      "binding_mode": current_binding,
+                                      "label_mode": current_label_mode
+                                  })
+                st.info("Rebuild request submitted for approval (existing semesters detected).")
+                st.stop()
+            else:
+                with engine.begin() as conn:
+                    cnt = _rebuild_semesters(conn, degree_code, current_binding, current_label_mode, target_id=None)
+                st.success(f"Rebuilt {cnt} semesters with {current_binding} binding.")
+                st.rerun()
+    
+    with col3:
+        # BUG FIX: Add permission check
+        st.button("📊 View Detailed Report (Future)", 
+                    type="secondary", 
+                    use_container_width=True,
+                    disabled=True, # Disabled until feature is implemented
+                    help="This feature is not yet implemented.")
+
 render()

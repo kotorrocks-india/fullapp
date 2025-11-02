@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import streamlit as st
 from sqlalchemy import text as sa_text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import Connection  # <-- FIX 1: Added this import
 
 # --- IMPORTS HAVE BEEN CORRECTED ---
 from core.settings import load_settings
-from core.db import get_engine, init_db
+from core.db import get_engine
 from core.forms import tagline, success
 from core.config_store import save, history
 # We now import and use the modern security system from policy.py
@@ -23,25 +25,34 @@ def _load_existing(engine, degree: str) -> dict:
     if row:
         try:
             return json.loads(row[0]) or {}
-        except Exception:
+        except json.JSONDecodeError as e:
+            st.error(f"Failed to load config: Corrupt JSON data in database. {e}")
             return {}
     return {}
 
 
-def _save(engine, degree: str, cfg: dict) -> None:
+def _save(engine_or_conn, degree: str, cfg: dict) -> None:
+    """Saves the config, using either a passed-in connection or a new transaction."""
     payload = json.dumps(cfg, ensure_ascii=False)
-    with engine.begin() as conn:
-        conn.execute(
-            sa_text(
-                """
-                INSERT INTO configs (degree, namespace, config_json)
-                VALUES (:d, :ns, :cfg)
-                ON CONFLICT(degree, namespace) DO UPDATE
-                SET config_json=excluded.config_json, updated_at=CURRENT_TIMESTAMP
-                """
-            ),
-            dict(d=degree, ns=NAMESPACE, cfg=payload),
-        )
+    sql = sa_text(
+        """
+        INSERT INTO configs (degree, namespace, config_json)
+        VALUES (:d, :ns, :cfg)
+        ON CONFLICT(degree, namespace) DO UPDATE
+        SET config_json=excluded.config_json, updated_at=CURRENT_TIMESTAMP
+        """
+    )
+    params = dict(d=degree, ns=NAMESPACE, cfg=payload)
+    
+    # <-- FIX 2: Changed logic to correctly detect a Connection
+    if isinstance(engine_or_conn, Connection):
+        # It's a connection, use it directly
+        engine_or_conn.execute(sql, params)
+    else:
+        # It's an engine, create a new transaction
+        with engine_or_conn.begin() as conn:
+            conn.execute(sql, params)
+
 
 # --- DECORATOR HAS BEEN CORRECTED ---
 @require_page("Footer")
@@ -52,8 +63,7 @@ def render():
 
     settings = load_settings()
     engine = get_engine(settings.db.url)
-    init_db(engine)
-
+    
     # Use the can_edit_page helper for granular control
     current_roles = user_roles()
     can_edit = can_edit_page("Footer", current_roles)
@@ -72,15 +82,25 @@ def render():
     st.subheader("Links")
     links = existing.get("links", [{"label": "Privacy", "url": "#"}])
     count = st.number_input("Number of links", min_value=0, max_value=20, value=len(links), step=1)
+    
     new_links = []
-    for i in range(int(count)):
+    num_links = int(count or 0) # Safer typecast
+    
+    for i in range(num_links):
         col1, col2 = st.columns([1, 2])
-        default_label = links[i]["label"] if i < len(links) and "label" in links[i] else ""
-        default_url = links[i]["url"] if i < len(links) and "url" in links[i] else ""
+        
+        default_label = ""
+        default_url = ""
+        
+        if i < len(links) and isinstance(links[i], dict):
+            default_label = links[i].get("label", "")
+            default_url = links[i].get("url", "")
+            
         with col1:
             lbl = st.text_input(f"Link {i+1} label", value=default_label, key=f"ln_label_{i}")
         with col2:
             url = st.text_input(f"Link {i+1} URL", value=default_url, key=f"ln_url_{i}")
+        
         if lbl or url:
             new_links.append({"label": lbl, "url": url})
 
@@ -95,18 +115,27 @@ def render():
     # The "Save" button is now disabled if the user lacks 'edit' permission
     if st.button("Save Footer", disabled=not can_edit):
         try:
+            # <-- FIX 3: Removed the 'with engine.begin() as conn:' wrapper.
+            # We must pass the 'engine' to both functions and let them
+            # manage their own transactions, as the imported 'save'
+            # function does not support participating in an existing transaction.
             save(
-                engine,
+                engine,  # Pass the engine
                 DEGREE,
                 NAMESPACE,
                 cfg,
                 saved_by=(st.session_state.get("user", {}) or {}).get("email"),
                 reason="update via footer",
             )
-            _save(engine, DEGREE, cfg)
+            _save(engine, DEGREE, cfg) # Pass the engine
+            
             success("Saved global footer (degree='*').")
+            st.rerun()
+
+        except SQLAlchemyError as e:
+            st.error(f"Database error: {e}")
         except Exception as e:
-            st.error(str(e))
+            st.error(f"An unexpected error occurred: {e}")
 
     st.subheader("Stored config (read-only)")
     st.json(_load_existing(engine, DEGREE))

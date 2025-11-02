@@ -1,0 +1,73 @@
+# app/screens/students/bulk_ops.py
+import streamlit as st
+from sqlalchemy.engine import Engine
+from sqlalchemy import text as sa_text
+
+# Import the new functions from your new importer
+from screens.students.importer import (
+    _add_student_import_export_section,
+    _add_student_mover_section,
+    _add_student_credential_export_section
+)
+
+def render(engine: Engine):
+    """
+    Renders the three-tab UI for student bulk operations.
+    Checks for degrees first and shows setup help if needed.
+    """
+    
+    # Check if degrees exist BEFORE creating tabs
+    with engine.begin() as conn:
+        degree_check = conn.execute(sa_text(
+            "SELECT COUNT(*) FROM degrees WHERE active = 1"
+        )).scalar()
+    
+    has_degrees = degree_check and degree_check > 0
+    
+    # If no degrees, show a unified setup page instead of empty tabs
+    if not has_degrees:
+        st.warning("⚠️ No degrees found. You need to set up degrees before using bulk operations.")
+        
+        st.info("""
+        ### 🚀 Getting Started with Student Management
+        
+        Before you can import students, you need to create the academic structure:
+        
+        1. **Navigate to the Degrees page** to create degrees (e.g., BTech, MTech, MBA)
+        2. *(Optional)* Create Programs and Branches for each degree
+        3. **Return here** to import and manage students
+        """)
+        
+        st.markdown("#### 👉 Next Steps")
+        st.markdown("- Go to the **Degrees** page from the sidebar")
+        st.markdown("- Create at least one degree to get started")
+        st.markdown("- Come back here to use bulk operations")
+        
+        st.divider()
+        
+        # Show preview of what will be available
+        st.markdown("""
+        ### 📋 Available Operations (once degrees are set up)
+        
+        - **📤 Import Students** - Bulk upload student data from CSV files
+        - **🚚 Student Mover** - Move students between batches/degrees  
+        - **🔑 Export Credentials** - Generate username/password files
+        """)
+        
+        return
+    
+    # Degrees exist - show normal tabs
+    tab1, tab2, tab3 = st.tabs([
+        "📤 Import Students",
+        "🚚 Student Mover",
+        "🔑 Export Credentials"
+    ])
+
+    with tab1:
+        _add_student_import_export_section(engine)
+
+    with tab2:
+        _add_student_mover_section(engine)
+
+    with tab3:
+        _add_student_credential_export_section(engine)

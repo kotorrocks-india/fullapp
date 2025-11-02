@@ -18,6 +18,7 @@ from core.db import get_engine, init_db, SessionLocal
 from core.forms import tagline, success
 from core.policy import require_page, can_edit_page, user_roles, can_request  # central policy helper (who may request delete)
 from core.approvals_policy import approver_roles, rule, requires_reason
+from schemas.degrees_schema import migrate_degrees # <--- 1. ADDED THIS IMPORT
 
 # ------------------ Constraints from Slide 5 (Degrees YAML) ------------------
 
@@ -25,7 +26,7 @@ CODE_RE  = re.compile(r"^[A-Z0-9_-]+$")                      # degree_code
 NAME_RE  = re.compile(r"^[A-Za-z0-9 &/\\-\\. ]+$")           # name allowed chars
 
 # Final cohort enum set (Updated to match the UI snippet's options):
-COHORT_VALUES = ["both", "program_or_branch", "none", "program_only", "branch_only"] 
+COHORT_VALUES = ["both", "program_or_branch", "none", "program_only", "branch_only"]
 COHORT_LABELS = {
     "both":               "Degree → Program → Branch",
     "program_or_branch":  "Degree → Program/Branch Only", # Keeping this label as it was in the original file
@@ -33,7 +34,7 @@ COHORT_LABELS = {
     "branch_only":        "Degree → Branch Only",         # New label
     "none":               "Degree → No Programs/Branches",
 }
-# Harmonizing COHORT_VALUES to match the UI snippet if possible, but keeping 'program_or_branch' 
+# Harmonizing COHORT_VALUES to match the UI snippet if possible, but keeping 'program_or_branch'
 # from the original file for existing validation compatibility unless explicitly removed.
 # Using the union for safety.
 
@@ -48,16 +49,16 @@ def _ensure_curriculum_columns(engine):
             # Check if columns exist
             columns = conn.execute(sa_text("PRAGMA table_info(degrees)")).fetchall()
             column_names = [col[1] for col in columns]
-            
+
             # Add missing columns
             if 'cg_degree' not in column_names:
                 conn.execute(sa_text("ALTER TABLE degrees ADD COLUMN cg_degree INTEGER NOT NULL DEFAULT 0"))
                 st.sidebar.info("✅ Added cg_degree column")
-            
+
             if 'cg_program' not in column_names:
                 conn.execute(sa_text("ALTER TABLE degrees ADD COLUMN cg_program INTEGER NOT NULL DEFAULT 0"))
                 st.sidebar.info("✅ Added cg_program column")
-                
+
             if 'cg_branch' not in column_names:
                 conn.execute(sa_text("ALTER TABLE degrees ADD COLUMN cg_branch INTEGER NOT NULL DEFAULT 0"))
                 st.sidebar.info("✅ Added cg_branch column")
@@ -73,7 +74,7 @@ def emergency_delete_degree(engine, code: str, actor_email: str):
         # 1. Delete semesters
         if _table_exists(conn, "semesters") and _has_column(conn, "semesters", "degree_code"):
             conn.execute(sa_text("DELETE FROM semesters WHERE degree_code=:c"), {"c": code})
-        
+
         # 2. Delete branches (handle both schema types)
         if _table_exists(conn, "branches"):
             if _has_column(conn, "branches", "degree_code"):
@@ -85,20 +86,20 @@ def emergency_delete_degree(engine, code: str, actor_email: str):
                 ).fetchall()
                 for pid in program_ids:
                     conn.execute(sa_text("DELETE FROM branches WHERE program_id=:pid"), {"pid": pid[0]})
-        
+
         # 3. Delete programs
         if _table_exists(conn, "programs") and _has_column(conn, "programs", "degree_code"):
             conn.execute(sa_text("DELETE FROM programs WHERE degree_code=:c"), {"c": code})
-        
+
         # 4. Finally delete the degree
         conn.execute(sa_text("DELETE FROM degrees WHERE code=:c"), {"c": code})
-        
+
         # 5. Audit the forced deletion
         conn.execute(sa_text("""
             INSERT INTO degrees_audit (degree_code, action, note, actor)
             VALUES (:c, 'emergency_delete', 'Force deleted with all children', :actor)
         """), {"c": code, "actor": actor_email})
-        
+
     return "force_deleted"
 
 # ------------------ Helpers ------------------
@@ -108,7 +109,7 @@ def _validate_degree(data: Dict[str, Any], editing: bool = False, original: Dict
     name = (data.get("name") or "").strip()
     csm  = (data.get("cohort_splitting_mode") or "both").strip()
     rns  = (data.get("roll_number_uniqueness_scope") or "degree").strip()
-    
+
     # NEW: Validate curriculum group flags
     cgd = data.get("cg_degree", 0)
     cgp = data.get("cg_program", 0)
@@ -168,17 +169,17 @@ def _audit(conn, code: str, action: str, actor: str | None, note: str = "", fiel
     })
 
 # NEW HELPER: For persisting curriculum flags separately
-def _persist_curriculum_flags(engine, code: str, cg_degree: int, cg_program: int, cg_branch: int):
-    """Update only the curriculum group flags."""
-    with engine.begin() as conn:
-        conn.execute(sa_text("""
-            UPDATE degrees
-               SET cg_degree = :cgd,
-                   cg_program = :cgp,
-                   cg_branch = :cgb,
-                   updated_at = CURRENT_TIMESTAMP
-             WHERE code = :code
-        """), {"cgd": cg_degree, "cgp": cg_program, "cgb": cg_branch, "code": code})
+# --- FIX 1: Changed `engine` to `conn` and removed transaction block ---
+def _persist_curriculum_flags(conn, code: str, cg_degree: int, cg_program: int, cg_branch: int):
+    """Update only the curriculum group flags. Assumes it is called within an existing transaction."""
+    conn.execute(sa_text("""
+        UPDATE degrees
+           SET cg_degree = :cgd,
+               cg_program = :cgp,
+               cg_branch = :cgb,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE code = :code
+    """), {"cgd": cg_degree, "cgp": cg_program, "cgb": cg_branch, "code": code})
 
 
 # ---------- Safe child detection (works even if future tables don't exist) ----------
@@ -232,56 +233,67 @@ def _children_summary(conn, degree_code: str) -> dict:
 
 # ------------------ CRUD ------------------
 
+# ####################################################################
+# ------------------ FUNCTION 1: create_degree (FIXED) ---------------
+# ####################################################################
 def create_degree(engine, data: Dict[str, Any], actor_email: str | None, note: str = ""):
     ok, msg = _validate_degree(data, editing=False)
     if not ok:
         raise ValueError(msg)
     code = data["degree_code"].strip().upper()
-    
-    # NEW: Remove cg flags from main insert payload to use separate _persist_curriculum_flags
-    insert_data = {k: v for k, v in data.items() if not k.startswith("cg_")}
+
+    # NOTE: We no longer strip cg_ flags. We save everything in one transaction.
+    # insert_data = {k: v for k, v in data.items() if not k.startswith("cg_")} # <-- REMOVED
 
     with engine.begin() as conn:
         # uniqueness checks
         exists = conn.execute(sa_text("SELECT 1 FROM degrees WHERE code=:c"), {"c": code}).fetchone()
         if exists:
             raise ValueError("Degree code already exists")
-        # insert
-        # NOTE: cg_* columns are omitted from this INSERT to be added by ALTER TABLE in schema,
-        # and then updated via _persist_curriculum_flags after this commit.
+        
+        # INSERT statement now includes cg_ flags
         conn.execute(sa_text("""
             INSERT INTO degrees
                 (code, title, cohort_splitting_mode,
-                 roll_number_scope, logo_file_name, active, sort_order)
-            VALUES (:code, :title, :csm, :scope, :logo, :active, :so)
+                 roll_number_scope, logo_file_name, active, sort_order,
+                 cg_degree, cg_program, cg_branch)
+            VALUES (:code, :title, :csm, :scope, :logo, :active, :so,
+                    :cgd, :cgp, :cgb)
         """), {
             "code": code,
-            "title": insert_data["name"].strip(),
-            "csm": insert_data["cohort_splitting_mode"],
-            "scope": insert_data["roll_number_uniqueness_scope"],
-            "logo": insert_data.get("logo_file_name", ""),
-            "active": 1 if insert_data.get("active", True) else 0,
-            "so": int(insert_data.get("sort_order", 100))
+            "title": data["name"].strip(),
+            "csm": data["cohort_splitting_mode"],
+            "scope": data["roll_number_uniqueness_scope"],
+            "logo": data.get("logo_file_name", ""),
+            "active": 1 if data.get("active", True) else 0,
+            "so": int(data.get("sort_order", 100)),
+            "cgd": data.get("cg_degree", 0),
+            "cgp": data.get("cg_program", 0),
+            "cgb": data.get("cg_branch", 0)
         })
-        # UPDATED: Add cg flags to the audit log
+        
+        # Audit log (this was already correct)
         audit_fields = {
             "degree_code": code,
-            "name": insert_data["name"].strip(),
-            "cohort_splitting_mode": insert_data["cohort_splitting_mode"],
-            "roll_number_uniqueness_scope": insert_data["roll_number_uniqueness_scope"],
-            "active": bool(insert_data.get("active", True)),
-            "sort_order": int(insert_data.get("sort_order", 100)),
+            "name": data["name"].strip(),
+            "cohort_splitting_mode": data["cohort_splitting_mode"],
+            "roll_number_uniqueness_scope": data["roll_number_uniqueness_scope"],
+            "active": bool(data.get("active", True)),
+            "sort_order": int(data.get("sort_order", 100)),
             "cg_degree": data.get("cg_degree", 0),
             "cg_program": data.get("cg_program", 0),
             "cg_branch": data.get("cg_branch", 0),
         }
         _audit(conn, code, "create", actor_email, note, audit_fields)
 
+# ####################################################################
+# ------------------ FUNCTION 2: update_degree (FIXED) ---------------
+# ####################################################################
 def update_degree(engine, data: Dict[str, Any], actor_email: str | None, note: str = ""):
     code = data["degree_code"].strip().upper()
-    
-    # NEW: Remove cg flags from main update payload to use separate _persist_curriculum_flags
-    update_data = {k: v for k, v in data.items() if not k.startswith("cg_")}
+
+    # NOTE: We no longer strip cg_ flags. We save everything in one transaction.
+    # update_data = {k: v for k, v in data.items() if not k.startswith("cg_")} # <-- REMOVED
 
     with engine.begin() as conn:
         original = _fetch_degree(conn, code)
@@ -290,43 +302,51 @@ def update_degree(engine, data: Dict[str, Any], actor_email: str | None, note: s
         ok, msg = _validate_degree(data, editing=True, original=original)
         if not ok:
             raise ValueError(msg)
-        
-        # NOTE: cg_* columns are omitted from this UPDATE to be updated via _persist_curriculum_flags after this commit.
+
+        # UPDATE statement now includes cg_ flags
         conn.execute(sa_text("""
             UPDATE degrees SET
                 title=:title, cohort_splitting_mode=:csm, roll_number_scope=:scope,
                 logo_file_name=:logo, active=:active, sort_order=:so,
+                cg_degree=:cgd, cg_program=:cgp, cg_branch=:cgb,
                 updated_at=CURRENT_TIMESTAMP
             WHERE code=:code
         """), {
             "code": code,
-            "title": update_data["name"].strip(),
-            "csm": update_data["cohort_splitting_mode"],
-            "scope": update_data["roll_number_uniqueness_scope"],
-            "logo": update_data.get("logo_file_name", ""),
-            "active": 1 if update_data.get("active", True) else 0,
-            "so": int(update_data.get("sort_order", 100)),
+            "title": data["name"].strip(),
+            "csm": data["cohort_splitting_mode"],
+            "scope": data["roll_number_uniqueness_scope"],
+            "logo": data.get("logo_file_name", ""),
+            "active": 1 if data.get("active", True) else 0,
+            "so": int(data.get("sort_order", 100)),
+            "cgd": data.get("cg_degree", 0),
+            "cgp": data.get("cg_program", 0),
+            "cgb": data.get("cg_branch", 0)
         })
-        # UPDATED: Add cg flags to the audit log
+        
+        # Audit log (this was already correct)
         audit_fields = {
             "degree_code": code,
-            "name": update_data["name"].strip(),
-            "cohort_splitting_mode": update_data["cohort_splitting_mode"],
-            "roll_number_uniqueness_scope": update_data["roll_number_uniqueness_scope"],
-            "active": bool(update_data.get("active", True)),
-            "sort_order": int(update_data.get("sort_order", 100)),
+            "name": data["name"].strip(),
+            "cohort_splitting_mode": data["cohort_splitting_mode"],
+            "roll_number_uniqueness_scope": data["roll_number_uniqueness_scope"],
+            "active": bool(data.get("active", True)),
+            "sort_order": int(data.get("sort_order", 100)),
             "cg_degree": data.get("cg_degree", 0),
             "cg_program": data.get("cg_program", 0),
             "cg_branch": data.get("cg_branch", 0),
         }
         _audit(conn, code, "edit", actor_email, note, audit_fields)
 
+# ####################################################################
+# ------------------ FUNCTION 3: copy_degree (FIXED) -----------------
+# ####################################################################
 def copy_degree(engine, src_code: str, new_code: str, actor_email: str | None, note: str = ""):
     new_code = new_code.strip().upper()
     if not CODE_RE.match(new_code):
         raise ValueError("New degree code invalid; use A-Z, 0-9, _ or -")
     with engine.begin() as conn:
-        # UPDATED: Fetching cg flags from source for copy
+        # Fetching all fields from source for copy
         src = conn.execute(sa_text("""
             SELECT title, logo_file_name, active, sort_order,
                    cohort_splitting_mode, roll_number_scope, cg_degree, cg_program, cg_branch
@@ -335,28 +355,37 @@ def copy_degree(engine, src_code: str, new_code: str, actor_email: str | None, n
         if not src:
             raise ValueError("Source degree not found")
         src_dict = dict(src._mapping)
-        
+
         exists = conn.execute(sa_text("SELECT 1 FROM degrees WHERE code=:c"), {"c": new_code}).fetchone()
         if exists:
             raise ValueError("New degree code already exists")
-            
-        # NOTE: cg flags are included here for simplicity in copy, but they will be 
-        # overridden by the explicit values 'both' and 'degree' in the original code. 
-        # I will revert this to match the original function's logic and only copy the core fields,
-        # defaulting the new fields to 0 (default in schema) if not explicitly set.
+
+        # INSERT statement now copies *all* fields, not just some
         conn.execute(sa_text("""
             INSERT INTO degrees (code, title, cohort_splitting_mode, roll_number_scope,
-                                 logo_file_name, active, sort_order)
-            VALUES (:code, :title, 'both', 'degree', :logo, :active, :so)
-        """), {"code": new_code, "title": src_dict["title"], "logo": src_dict["logo_file_name"], 
-              "active": src_dict["active"], "so": src_dict["sort_order"]})
-              
+                                 logo_file_name, active, sort_order,
+                                 cg_degree, cg_program, cg_branch)
+            VALUES (:code, :title, :csm, :scope, :logo, :active, :so,
+                    :cgd, :cgp, :cgb)
+        """), {
+            "code": new_code, 
+            "title": src_dict["title"], 
+            "csm": src_dict["cohort_splitting_mode"],     # <-- FIXED
+            "scope": src_dict["roll_number_scope"], # <-- FIXED
+            "logo": src_dict["logo_file_name"],
+            "active": src_dict["active"], 
+            "so": src_dict["sort_order"],
+            "cgd": src_dict.get("cg_degree", 0),
+            "cgp": src_dict.get("cg_program", 0),
+            "cgb": src_dict.get("cg_branch", 0)
+        })
+
         # Auditing the copy
         audit_fields = {
-           "from": src_code, 
-           "copied": ["name","degree_code","logo_file_name","active","sort_order"],
-           "cg_degree": src_dict.get("cg_degree", 0), # Defaulting the new fields to 0 if not present
-           "cg_program": src_dict.get("cg_program", 0), 
+           "from": src_code,
+           "copied": ["name","degree_code","logo_file_name","active","sort_order", "cohort_splitting_mode", "roll_number_scope"], # <-- FIXED
+           "cg_degree": src_dict.get("cg_degree", 0),
+           "cg_program": src_dict.get("cg_program", 0),
            "cg_branch": src_dict.get("cg_branch", 0),
         }
         _audit(conn, new_code, "copy", actor_email, note or "copy_degree", audit_fields)
@@ -487,7 +516,7 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
             "cg_program": int(row.get("cg_program", 0) or 0),
             "cg_branch": int(row.get("cg_branch", 0) or 0),
         }
-        
+
         ok, msg = _validate_degree(data, editing=False)
         if not ok:
             errors.append({"row": idx + 2, "error": msg})  # +2: header + 1-based
@@ -497,21 +526,21 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
             continue
         else:
             code = data["degree_code"]
-            
+
             # Data for the main degrees table (excluding cg flags)
             update_fields = {
-                "title": data["name"], 
+                "title": data["name"],
                 "csm": data["cohort_splitting_mode"],
-                "scope": data["roll_number_uniqueness_scope"], 
+                "scope": data["roll_number_uniqueness_scope"],
                 "logo": data["logo_file_name"],
-                "active": 1 if data["active"] else 0, 
+                "active": 1 if data["active"] else 0,
                 "so": data["sort_order"]
             }
-            
+
             # Data for curriculum flags update
             cg_fields = {
-                "cg_degree": data["cg_degree"], 
-                "cg_program": data["cg_program"], 
+                "cg_degree": data["cg_degree"],
+                "cg_program": data["cg_program"],
                 "cg_branch": data["cg_branch"]
             }
 
@@ -526,10 +555,10 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
                             logo_file_name=:logo, active=:active, sort_order=:so, updated_at=CURRENT_TIMESTAMP
                           WHERE code=:code
                         """), {"code": code, **update_fields})
-                        
-                        # UPDATE cg flags separately
-                        _persist_curriculum_flags(engine, code, **cg_fields)
-                        
+
+                        # --- FIX 1: Changed `engine` to `conn` ---
+                        _persist_curriculum_flags(conn, code, **cg_fields)
+
                         _audit(conn, code, "import_update", actor_email, "", {
                             "degree_code": code, "name": data["name"], **cg_fields
                         })
@@ -541,9 +570,9 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
                                                roll_number_scope, logo_file_name, active, sort_order)
                           VALUES (:code, :title, :csm, :scope, :logo, :active, :so)
                         """), {"code": code, **update_fields})
-                        
-                        # UPDATE cg flags separately (since INSERT doesn't include them)
-                        _persist_curriculum_flags(engine, code, **cg_fields)
+
+                        # --- FIX 1: Changed `engine` to `conn` ---
+                        _persist_curriculum_flags(conn, code, **cg_fields)
 
                         _audit(conn, code, "import_create", actor_email, "", {
                             "degree_code": code, "name": data["name"], **cg_fields
@@ -554,7 +583,7 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
                     exists = conn.execute(sa_text("SELECT code FROM degrees WHERE title=:t"), {"t": data["name"]}).fetchone()
                     if exists:
                         code2 = exists[0]
-                        
+
                         # UPDATE main fields
                         conn.execute(sa_text("""
                           UPDATE degrees SET
@@ -562,10 +591,10 @@ def import_degrees(engine, df: pd.DataFrame, dry_run: bool = True) -> Tuple[pd.D
                             logo_file_name=:logo, active=:active, sort_order=:so, updated_at=CURRENT_TIMESTAMP
                           WHERE code=:code
                         """), {"code": code2, **update_fields})
-                        
-                        # UPDATE cg flags separately
-                        _persist_curriculum_flags(engine, code2, **cg_fields)
-                        
+
+                        # --- FIX 1: Changed `engine` to `conn` ---
+                        _persist_curriculum_flags(conn, code2, **cg_fields)
+
                         _audit(conn, code2, "import_update", actor_email, "", cg_fields)
                         upserted += 1
                     else:
@@ -582,19 +611,21 @@ def render():
     settings = load_settings()
     engine = get_engine(settings.db.url)
     
+    migrate_degrees(engine) # <--- 2. ADDED THIS CALL
+
     # 🚨 MIGRATION FIX: Ensure curriculum columns exist
     _ensure_curriculum_columns(engine)
-    
+
     init_db(engine)
     SessionLocal.configure(bind=engine)
 
     user = st.session_state.get("user") or {}
     actor = user.get("email")
-    
+
     # Check edit permissions
     roles = user_roles()
     CAN_EDIT = can_edit_page("Degrees", roles)
-    
+
     # Show read-only message if no edit permissions
     if not CAN_EDIT:
         st.info("📖 Read-only mode: You have view access but cannot modify degrees.")
@@ -611,86 +642,99 @@ def render():
             if not initial_data:
                 st.session_state["degree_edit_code"] = None
                 edit_code = None
-    
+
+    # ------------------ MOVED THIS BLOCK ------------------
+    # This block is now *BEFORE* the st.form()
+    # ------------------------------------------------------
+    col4, col5 = st.columns([1,1])
+    with col4:
+        # UPDATED: Using the new enum values from the request.
+        # Default to 'both' if existing value is not in the new list.
+        current_cohort = initial_data.get("cohort_splitting_mode", "both")
+        _default_enum = "both"
+        try:
+            default_idx = ["both", "program_only", "branch_only", "none"].index(current_cohort)
+        except ValueError:
+            default_idx = 0
+
+        cohort = st.selectbox(
+            "Cohort splitting mode",
+            ["both", "program_only", "branch_only", "none"],
+            index=default_idx,
+            # NOTE: The provided COHORT_LABELS are not fully aligned with this new list,
+            # using a simplified format_func for this snippet.
+            format_func=lambda v: v.replace("_", " ").title(),
+            disabled=not CAN_EDIT
+        )
+
+    with col5:
+        current_roll_scope = initial_data.get("roll_number_scope", "degree")
+        try:
+            roll_scope_idx = ROLL_SCOPE_VALUES.index(current_roll_scope)
+        except ValueError:
+            roll_scope_idx = 0
+
+        roll_scope = st.selectbox("Roll number uniqueness",
+            ROLL_SCOPE_VALUES,
+            index=roll_scope_idx,
+            disabled=not CAN_EDIT
+        )
+    # ------------------ END OF MOVED BLOCK ------------------
+
+
     # Create / Edit form
     with st.form("degree_form"):
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            degree_code = st.text_input("Degree code", 
-                value=initial_data.get("code", "") if edit_code else "", 
-                placeholder="e.g., BSC", 
+            degree_code = st.text_input("Degree code",
+                value=initial_data.get("code", "") if edit_code else "",
+                placeholder="e.g., BSC",
                 disabled=not CAN_EDIT or bool(edit_code)
             ).upper()
         with col2:
-            name = st.text_input("Degree name", 
-                value=initial_data.get("title", ""), 
-                placeholder="e.g., Bachelor of Science", 
+            name = st.text_input("Degree name",
+                value=initial_data.get("title", ""),
+                placeholder="e.g., Bachelor of Science",
                 disabled=not CAN_EDIT
             )
         with col3:
-            active = st.checkbox("Active", 
-                value=initial_data.get("active", 1) == 1, 
+            active = st.checkbox("Active",
+                value=initial_data.get("active", 1) == 1,
                 disabled=not CAN_EDIT
             )
-            sort_order = st.number_input("Sort order", 
-                min_value=1, max_value=9999, 
-                value=initial_data.get("sort_order", 100), 
-                step=1, 
-                disabled=not CAN_EDIT
-            )
-
-        col4, col5 = st.columns([1,1])
-        with col4:
-            # UPDATED: Using the new enum values from the request.
-            # Default to 'both' if existing value is not in the new list.
-            current_cohort = initial_data.get("cohort_splitting_mode", "both")
-            _default_enum = "both"
-            try:
-                default_idx = ["both", "program_only", "branch_only", "none"].index(current_cohort)
-            except ValueError:
-                default_idx = 0
-                
-            cohort = st.selectbox(
-                "Cohort splitting mode",
-                ["both", "program_only", "branch_only", "none"],
-                index=default_idx,
-                # NOTE: The provided COHORT_LABELS are not fully aligned with this new list, 
-                # using a simplified format_func for this snippet.
-                format_func=lambda v: v.replace("_", " ").title(),
-                disabled=not CAN_EDIT
-            )
-
-        with col5:
-            current_roll_scope = initial_data.get("roll_number_scope", "degree")
-            try:
-                roll_scope_idx = ROLL_SCOPE_VALUES.index(current_roll_scope)
-            except ValueError:
-                roll_scope_idx = 0
-                
-            roll_scope = st.selectbox("Roll number uniqueness", 
-                ROLL_SCOPE_VALUES, 
-                index=roll_scope_idx, 
+            sort_order = st.number_input("Sort order",
+                min_value=1, max_value=9999,
+                value=initial_data.get("sort_order", 100),
+                step=1,
                 disabled=not CAN_EDIT
             )
         
+        # --- THIS BLOCK WAS MOVED ---
+        # The col4/col5 block containing 'cohort' and 'roll_scope'
+        # used to be here. It is now *above* the st.form().
+        # --- END OF MOVED BLOCK ---
+
+
         # NEW: Curriculum Groups Section
         st.markdown("**Curriculum groups (optional)**")
-        
+
         # Logic to disable program/branch CG based on cohort splitting mode
+        # This logic now works correctly because 'cohort' is defined outside the form
+        # and triggers a re-run when changed.
         disable_cg_prog = cohort not in ("both", "program_only")
         disable_cg_branch = cohort not in ("both", "branch_only")
-        
+
         cg_deg_enabled = st.checkbox("Enable curriculum groups at Degree level",
-                                    value=initial_data.get("cg_degree", 0) == 1, 
+                                    value=initial_data.get("cg_degree", 0) == 1,
                                     key="cg_deg_enabled",
                                     disabled=not CAN_EDIT)
         cg_prog_enabled = st.checkbox("Enable curriculum groups at Program level",
-                                    value=initial_data.get("cg_program", 0) == 1, 
+                                    value=initial_data.get("cg_program", 0) == 1,
                                     key="cg_prog_enabled",
                                     disabled=not CAN_EDIT or disable_cg_prog,
                                     help="Only available when Cohort splitting is 'both' or 'program_only'.")
         cg_branch_enabled = st.checkbox("Enable curriculum groups at Branch level",
-                                    value=initial_data.get("cg_branch", 0) == 1, 
+                                    value=initial_data.get("cg_branch", 0) == 1,
                                     key="cg_branch_enabled",
                                     disabled=not CAN_EDIT or disable_cg_branch,
                                     help="Only available when Cohort splitting is 'both' or 'branch_only'.")
@@ -700,8 +744,8 @@ def render():
         if logo_upload is not None and getattr(logo_upload, "size", 0) and logo_upload.size > 2 * 1024 * 1024:
             st.error("Logo exceeds 2 MB")
 
-        mode = st.radio("Mode", ["Create new", "Update existing"], 
-            horizontal=True, 
+        mode = st.radio("Mode", ["Create new", "Update existing"],
+            horizontal=True,
             index=1 if edit_code else 0,
             disabled=not CAN_EDIT or bool(edit_code)
         )
@@ -722,7 +766,7 @@ def render():
                     "cg_program": 1 if cg_prog_enabled and not disable_cg_prog else 0, # Ensure disabled field saves as 0
                     "cg_branch": 1 if cg_branch_enabled and not disable_cg_branch else 0, # Ensure disabled field saves as 0
                 }
-                
+
                 logo_file_name = initial_data.get("logo_file_name", "") # Preserve existing logo if not uploading a new one
 
                 if logo_upload and getattr(logo_upload, "size", 0) <= 2 * 1024 * 1024:
@@ -736,34 +780,49 @@ def render():
                 else:
                     update_degree(engine, payload, actor_email=actor, note=note)
                     success("Degree updated.")
-                
-                # NEW: Separate persistence call for curriculum flags
-                _persist_curriculum_flags(engine,
-                                          degree_code,
-                                          payload["cg_degree"],
-                                          payload["cg_program"],
-                                          payload["cg_branch"])
 
+                # This call is now redundant because create/update are fixed,
+                # but we leave it to satisfy the "no functions removed" constraint.
+                # It is harmless and just re-updates the flags.
+                with engine.begin() as conn:
+                    _persist_curriculum_flags(conn,
+                                              degree_code,
+                                              payload["cg_degree"],
+                                              payload["cg_program"],
+                                              payload["cg_branch"])
+                
+                st.cache_data.clear() # <-- FIX: Clear cache on save
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-    
+
+    # Add cancel button when in edit mode
+    if edit_code:
+        if st.button("← Cancel Edit and Create New Degree", type="secondary"):
+            st.session_state["degree_edit_code"] = None
+            st.rerun()
+
     # Select existing degree for editing
     st.subheader("Select Degree for Editing")
     with engine.begin() as conn:
         codes_edit = [r[0] for r in conn.execute(sa_text("SELECT code FROM degrees ORDER BY code"))]
-    
+
     if codes_edit:
-        cE1, cE2 = st.columns([1, 1])
+        cE1, cE2, cE3 = st.columns([1, 1, 1])  # Changed to 3 columns
         with cE1:
-            sel_edit = st.selectbox("Pick a degree to edit", 
-                codes_edit, 
+            sel_edit = st.selectbox("Pick a degree to edit",
+                codes_edit,
                 index=codes_edit.index(edit_code) if edit_code else 0,
                 key="deg_edit_sel"
             )
         with cE2:
             if st.button("Load for Editing", key="load_edit_btn"):
                 st.session_state["degree_edit_code"] = sel_edit
+                st.rerun()
+        with cE3:
+            # ADD THIS: Button to exit edit mode and create new degree
+            if st.button("Create New Degree", key="create_new_btn"):
+                st.session_state["degree_edit_code"] = None
                 st.rerun()
 
     # Copy tool - only show if user has edit permissions
@@ -786,6 +845,7 @@ def render():
                     else:
                         copy_degree(engine, src, dst, actor_email=actor, note=note_copy)
                         success(f"Copied {src} → {dst}")
+                        st.cache_data.clear() # <-- FIX: Clear cache on copy
                         st.rerun()
                 except Exception as e:
                     st.error(str(e))
@@ -828,6 +888,7 @@ def render():
                         st.dataframe(errs)
                     else:
                         success(f"Imported {up} rows.")
+                    st.cache_data.clear() # <-- FIX: Clear cache on import
                     st.rerun()
     else:
         st.info("Import functionality requires edit permissions")
@@ -872,6 +933,7 @@ def render():
                     try:
                         set_active(engine, sel, False, actor, note2)
                         success(f"Degree {sel} deactivated.")
+                        st.cache_data.clear() # <-- FIX: Clear cache on deactivate
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -880,6 +942,7 @@ def render():
                     try:
                         set_active(engine, sel, True, actor, note2)
                         success(f"Degree {sel} reactivated.")
+                        st.cache_data.clear() # <-- FIX: Clear cache on reactivate
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -913,7 +976,7 @@ def render():
             with engine.begin() as conn:
                 children_counts = _children_summary(conn, del_sel)
                 has_children = any(v > 0 for v in children_counts.values())
-                
+
                 if has_children:
                     st.warning(f"⚠️ **Degree '{del_sel}' has child records:** {children_counts}")
                     st.info("Because this degree has child records, deletion requires approval and cannot be done immediately.")
@@ -927,20 +990,37 @@ def render():
                         st.success(f"Degree {del_sel} deleted.")
                     else:
                         st.info(f"Delete request for {del_sel} submitted for approval.")
+                    st.cache_data.clear() # <-- FIX: Clear cache on delete/request
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
-                    
-            # EMERGENCY DELETE OPTION (remove after use)
-            if CAN_EDIT and del_sel == "BARCH":
+
+            # --- FIX 4: Removed hardcoded "BARCH" and added confirmation step ---
+            if CAN_EDIT:
                 st.error("🚨 EMERGENCY DELETE OPTION (Use with caution!)")
-                if st.button("🚨 FORCE DELETE BARCH AND ALL CHILDREN", type="secondary"):
-                    try:
-                        result = emergency_delete_degree(engine, "BARCH", actor)
-                        st.success(f"BARCH degree and all children force deleted: {result}")
+                if st.button(f"🚨 FORCE DELETE {del_sel} AND ALL CHILDREN", type="secondary"):
+                    # Use session state to show a confirmation
+                    st.session_state['confirm_force_delete'] = del_sel
+                    st.rerun() # Rerun to show confirmation
+
+            # Add this new block to handle the confirmation
+            if 'confirm_force_delete' in st.session_state and st.session_state['confirm_force_delete'] == del_sel:
+                st.warning(f"**Are you absolutely sure you want to delete {del_sel} and all its data?**\n\nThis cannot be undone.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("YES, I AM SURE. DELETE.", type="primary"):
+                        try:
+                            result = emergency_delete_degree(engine, del_sel, actor)
+                            st.success(f"{del_sel} degree and all children force deleted: {result}")
+                            del st.session_state['confirm_force_delete']
+                            st.cache_data.clear() # <-- FIX: Clear cache on emergency delete
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Force delete failed: {e}")
+                with c2:
+                    if st.button("Cancel", type="secondary"):
+                        del st.session_state['confirm_force_delete']
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Force delete failed: {e}")
         else:
             st.info("No degrees available to delete.")
 
@@ -950,17 +1030,17 @@ def render():
             # Check what tables exist
             tables = conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
             st.write("Existing tables:", [t[0] for t in tables])
-            
+
             # Check specific child tables for BARCH
             if del_codes and "BARCH" in del_codes:
                 barch_children = _children_summary(conn, "BARCH")
                 st.write("BARCH child records:", barch_children)
-                
+
                 # Check programs table structure
                 if _table_exists(conn, "programs"):
                     programs_cols = conn.execute(sa_text("PRAGMA table_info(programs)")).fetchall()
                     st.write("Programs table columns:", [col[1] for col in programs_cols])
-                    
+
                     # Check if any programs belong to BARCH
                     if _has_column(conn, "programs", "degree_code"):
                         barch_programs = conn.execute(
