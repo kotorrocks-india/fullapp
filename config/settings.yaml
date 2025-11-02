@@ -1,0 +1,12 @@
+app:
+  name: "EPLP EDU App (Phase 1)"
+  environment: "dev"
+  approvals:
+    enabled: false
+auth:
+  demo_superadmin_user: "superadmin@demo.edu"
+  demo_superadmin_pass: "admin"
+branding:
+  default_degree_branding: true
+db:
+  url: "sqlite:///app_v2.db"
