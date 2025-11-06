@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Engine
+import json
+import logging
+
+log = logging.getLogger(__name__)
 
 def install_schema(engine: Engine) -> None:
     """
@@ -16,6 +20,7 @@ def install_schema(engine: Engine) -> None:
     - student_initial_credentials.student_profile_id (not student_id)
     """
     ddl = [
+      
         # 1) Core student profile
         """
         CREATE TABLE IF NOT EXISTS student_profiles (
@@ -71,7 +76,8 @@ def install_schema(engine: Engine) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             label TEXT NOT NULL,
-            dtype TEXT NOT NULL,           -- 'text' | 'number' | 'date' | 'choice'
+            dtype TEXT NOT NULL,         
+            -- 'text' | 'number' | 'date' | 'choice' | 'boolean'
             required INTEGER DEFAULT 0,
             active INTEGER DEFAULT 1,
             sort_order INTEGER DEFAULT 0,
@@ -95,6 +101,52 @@ def install_schema(engine: Engine) -> None:
         )
         """,
 
+        # --- NEW TABLES ADDED ---
+        
+        # 6) Formal batch hierarchy
+        """
+        CREATE TABLE IF NOT EXISTS degree_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            degree_code TEXT NOT NULL,
+            batch_code TEXT NOT NULL,
+            batch_name TEXT,
+            start_date DATE NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(degree_code, batch_code)
+        );
+        """,
+
+        # 7) Application settings
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """,
+        
+        # 8) Degree-to-Year scaffold
+        """
+        CREATE TABLE IF NOT EXISTS degree_year_scaffold (
+            degree_code TEXT NOT NULL,
+            year_num INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (degree_code, year_num)
+        );
+        """,
+
+        # 9) Batch-to-Year scaffold
+        """
+        CREATE TABLE IF NOT EXISTS batch_year_scaffold (
+            degree_code TEXT NOT NULL,
+            batch TEXT NOT NULL,
+            year_num INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (degree_code, batch, year_num)
+        );
+        """,
+        
+        # --- END OF ADDED TABLES ---
+
         # Helpful indexes
         "CREATE INDEX IF NOT EXISTS idx_student_profiles_email ON student_profiles(email)",
         "CREATE INDEX IF NOT EXISTS idx_student_profiles_sid   ON student_profiles(student_id)",
@@ -106,9 +158,14 @@ def install_schema(engine: Engine) -> None:
         "CREATE INDEX IF NOT EXISTS idx_custom_data_student    ON student_custom_profile_data(student_profile_id)"
     ]
 
-    with engine.begin() as conn:
-        for stmt in ddl:
-            conn.execute(sa_text(stmt))
+    try:
+        with engine.begin() as conn:
+            for stmt in ddl:
+                conn.execute(sa_text(stmt))
+        log.info("✅ Student schema installed/verified successfully.")
+    except Exception as e:
+        log.error(f"❌ Failed to install student schema: {e}")
+        raise
 
 
 def migrate_existing_schema(engine: Engine) -> None:

@@ -1,130 +1,133 @@
+# schemas/approvals_schema.py
 from __future__ import annotations
 from sqlalchemy import text as sa_text
-from core.schema_registry import register
+
+# Assuming your decorator is in core
+try:
+    from core.schema_registry import register
+except ImportError:
+    # Dummy decorator for safety
+    def register(func): return func
 
 @register
 def ensure_approvals_schema(engine):
+    """
+    Ensures the 'approvals' and 'approvals_votes' tables are correct.
+    This replaces the old migration script with a safe, idempotent version.
+    """
     with engine.begin() as conn:
-        # First, check if the table exists and what columns it has
+        
+        # --- 1. Check for old schema (object_id=INTEGER) and migrate ---
         table_exists = conn.execute(sa_text("""
             SELECT name FROM sqlite_master 
             WHERE type='table' AND name='approvals'
         """)).fetchone()
         
         if table_exists:
-            # Table exists, check if we need to migrate schema
-            existing_columns = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall()}
-            
-            # Add missing columns if needed (without complex defaults)
-            if 'payload' not in existing_columns:
-                conn.execute(sa_text("ALTER TABLE approvals ADD COLUMN payload TEXT"))
-            if 'requester_email' not in existing_columns:
-                conn.execute(sa_text("ALTER TABLE approvals ADD COLUMN requester_email TEXT"))
-            if 'reason_note' not in existing_columns:
-                conn.execute(sa_text("ALTER TABLE approvals ADD COLUMN reason_note TEXT"))
-            if 'updated_at' not in existing_columns:
-                conn.execute(sa_text("ALTER TABLE approvals ADD COLUMN updated_at DATETIME"))
-                # Set default value for existing rows
-                conn.execute(sa_text("UPDATE approvals SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
-            
-            # Check if object_id is INTEGER and needs migration
             object_id_info = next((row for row in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall() if row[1] == 'object_id'), None)
             if object_id_info and object_id_info[2].upper() == 'INTEGER':
-                # We'll handle this with a full table migration
-                _migrate_approvals_table(conn)
-        else:
-            # Create new table with correct schema
-            conn.execute(sa_text("""
-            CREATE TABLE approvals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                object_type TEXT NOT NULL,
-                object_id   TEXT NOT NULL,
-                action      TEXT NOT NULL,
-                requester   TEXT,
-                requester_email TEXT,
-                approver    TEXT,
-                rule        TEXT,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                reason_note TEXT,
-                note        TEXT,
-                payload     TEXT,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                decided_at  DATETIME,
-                updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-            )"""))
-
-        # Create indexes (they will be created only if they don't exist)
-        conn.execute(sa_text("""
-            CREATE INDEX IF NOT EXISTS idx_approvals_object 
-            ON approvals(object_type, object_id)
-        """))
-        conn.execute(sa_text("""
-            CREATE INDEX IF NOT EXISTS idx_approvals_status 
-            ON approvals(status)
-        """))
-        conn.execute(sa_text("""
-            CREATE INDEX IF NOT EXISTS idx_approvals_requester 
-            ON approvals(requester)
-        """))
+                # We have the old schema. We must migrate it.
+                _migrate_approvals_to_text_object_id(conn)
         
-        # Only create requester_email index if the column exists
-        existing_columns_after = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall()}
-        if 'requester_email' in existing_columns_after:
-            conn.execute(sa_text("""
-                CREATE INDEX IF NOT EXISTS idx_approvals_requester_email 
-                ON approvals(requester_email)
-            """))
-        
-        # Create payload index if column exists
-        if 'payload' in existing_columns_after:
-            conn.execute(sa_text("""
-                CREATE INDEX IF NOT EXISTS idx_approvals_payload 
-                ON approvals(payload)
-            """))
-
-def _migrate_approvals_table(conn):
-    """Migrate existing approvals table to new schema - only if object_id is INTEGER"""
-    print("Migrating approvals table schema...")
-    
-    # Create temporary table with new schema
-    conn.execute(sa_text("""
-        CREATE TABLE approvals_new (
+        # --- 2. Create/Update 'approvals' table ---
+        conn.execute(sa_text("""
+        CREATE TABLE IF NOT EXISTS approvals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             object_type TEXT NOT NULL,
             object_id   TEXT NOT NULL,
             action      TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
             requester   TEXT,
             requester_email TEXT,
             approver    TEXT,
-            rule        TEXT,
-            status      TEXT NOT NULL DEFAULT 'pending',
-            reason_note TEXT,
-            note        TEXT,
             payload     TEXT,
+            reason_note TEXT,
+            decision_note TEXT,
+            rule        TEXT,
             created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             decided_at  DATETIME,
             updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )"""))
+
+        # --- 3. Create/Update 'approvals_votes' table ---
+        conn.execute(sa_text("""
+        CREATE TABLE IF NOT EXISTS approvals_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_id INTEGER NOT NULL,
+            voter_email TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (approval_id) REFERENCES approvals(id) ON DELETE CASCADE,
+            UNIQUE(approval_id, voter_email)
         )
-    """))
-    
-    # Copy data from old table to new table
-    conn.execute(sa_text("""
-        INSERT INTO approvals_new (
-            id, object_type, object_id, action, requester, requester_email, 
-            approver, rule, status, reason_note, note, payload, created_at, decided_at, updated_at
-        )
-        SELECT 
-            id, object_type, CAST(object_id AS TEXT), action, requester, requester,
-            approver, rule, status, 
-            CASE WHEN note IS NOT NULL THEN note ELSE '' END,  -- Use existing note as reason_note if needed
-            note, 
-            '' as payload,  -- Initialize empty payload for existing records
-            created_at, decided_at, CURRENT_TIMESTAMP
-        FROM approvals
-    """))
-    
-    # Drop old table and rename new one
-    conn.execute(sa_text("DROP TABLE approvals"))
-    conn.execute(sa_text("ALTER TABLE approvals_new RENAME TO approvals"))
-    
-    print("Approvals table migration completed.")
+        """))
+
+        # --- 4. Ensure Indexes ---
+        conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)"))
+        conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_approvals_type_action ON approvals(object_type, action)"))
+        conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_approvals_requester ON approvals(requester_email)"))
+        conn.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_votes_approval ON approvals_votes(approval_id)"))
+        
+        # --- 5. Add any missing columns (idempotent) ---
+        _safe_add_column(conn, 'approvals', 'decision_note', 'TEXT')
+
+
+def _safe_add_column(conn, table_name, col_name, col_type):
+    """Safely adds a column to a table if it doesn't exist."""
+    try:
+        # Check if column exists
+        cols = {row[1] for row in conn.execute(sa_text(f"PRAGMA table_info({table_name})")).fetchall()}
+        if col_name not in cols:
+            conn.execute(sa_text(f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'))
+    except Exception:
+        pass # Ignore errors, like if table is in a transaction
+
+def _migrate_approvals_to_text_object_id(conn):
+    """Migrate existing approvals table (with object_id=INTEGER) to new schema"""
+    try:
+        # 1. Rename old table
+        conn.execute(sa_text("ALTER TABLE approvals RENAME TO approvals_old"))
+        
+        # 2. Create new table with correct schema
+        conn.execute(sa_text("""
+        CREATE TABLE approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_type TEXT NOT NULL,
+            object_id   TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            requester   TEXT,
+            requester_email TEXT,
+            approver    TEXT,
+            payload     TEXT,
+            reason_note TEXT,
+            decision_note TEXT,
+            rule        TEXT,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            decided_at  DATETIME,
+            updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )"""))
+        
+        # 3. Copy data, casting object_id to TEXT
+        conn.execute(sa_text("""
+            INSERT INTO approvals (
+                id, object_type, object_id, action, status, requester, 
+                requester_email, approver, payload, reason_note, decision_note, 
+                rule, created_at, decided_at, updated_at
+            )
+            SELECT 
+                id, object_type, CAST(object_id AS TEXT), action, status, requester, 
+                requester_email, approver, payload, reason_note, note, -- 'note' becomes 'decision_note'
+                rule, created_at, decided_at, CURRENT_TIMESTAMP
+            FROM approvals_old
+        """))
+        
+        # 4. Drop old table
+        conn.execute(sa_text("DROP TABLE approvals_old"))
+        
+    except Exception as e:
+        # If migration fails, try to restore
+        conn.execute(sa_text("DROP TABLE IF EXISTS approvals"))
+        conn.execute(sa_text("ALTER TABLE approvals_old RENAME TO approvals"))
+        raise e

@@ -26,7 +26,11 @@ def install_office_admin_schema(engine) -> None:
         email TEXT NOT NULL UNIQUE,
         username TEXT UNIQUE,
         full_name TEXT NOT NULL,
+        designation TEXT,          -- e.g., Jr. Office Admin, Sr. Office Admin
         status TEXT NOT NULL DEFAULT 'active',  -- active | disabled
+        home_degree_code TEXT,     -- primary affiliation (optional)
+        home_program_id INTEGER,
+        home_branch_id INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         created_by TEXT,
@@ -90,12 +94,12 @@ def install_office_admin_schema(engine) -> None:
         user_agent TEXT
     );
 
-    -- Export Requests (students roster, attendance, marks)
+    -- Export Requests (students roster, attendance, marks, credentials)
     CREATE TABLE IF NOT EXISTS office_admin_export_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         request_code TEXT NOT NULL UNIQUE,
         admin_email TEXT NOT NULL,
-        entity_type TEXT NOT NULL,  -- students_roster | attendance_summary | marks_summary
+        entity_type TEXT NOT NULL,  -- students_roster | attendance_summary | marks_summary | initial_credentials
         scope_type TEXT,            -- degree | program | branch
         scope_value TEXT,           -- degree_code, program_id, or branch_id
         reason TEXT NOT NULL,
