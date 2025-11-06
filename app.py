@@ -142,10 +142,13 @@ def _build_flat_pages(roles: set[str]):
     _add_page_if("Faculty", "faculty", "👨‍🏫 Faculty", roles, pages, missing)
     _add_page_if("Academic Years", "academic_years", "🗓️ Academic Years", roles, pages, missing)
     _add_page_if("Students", "students", "🎓 Students", roles, pages, missing)
-    _add_page_if("Subjects", "subjects_syllabus", "📘 Subjects", roles, pages, missing)
+    _add_page_if("Subjects Offerings", "subjects_syllabus", "📘 Subjects Offerings", roles, pages, missing)
+    _add_page_if("Electives & College Projects", "electives_topics", "🎯 Electives & College Projects", roles, pages, missing)
+    #_add_page_if("Subjects AY COs Rubrics", "subjects_syllabus", "📘 Subjects", roles, pages, missing)
     # _add_page_if("Assignments", "assignments", "📝 Assignments", roles, pages, missing)
     # _add_page_if("Marks", "marks", "✅ Marks", roles, pages, missing)
     _add_page_if("Approvals", "approvals", "📬 Approvals", roles, pages, missing)
+    _add_page_if("Approval Management", "approval_management", "⚙️ Approval Management", roles, pages, missing)
 
     if missing:
         st.sidebar.warning(f"Missing pages: {[m[0] for m in missing]}")
