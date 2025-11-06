@@ -1,5 +1,9 @@
 # app/screens/students/bulk_ops.py
-# FIXED: Properly organized tabs without duplication
+# -------------------------------------------------------------------
+# MODIFIED VERSION
+# - Added a new tab: "Export Full Data"
+# - Imported and called the new exporter function.
+# -------------------------------------------------------------------
 
 import streamlit as st
 from sqlalchemy.engine import Engine
@@ -8,13 +12,14 @@ from sqlalchemy import text as sa_text
 from screens.students.importer import (
     _add_student_import_export_section,
     _add_student_mover_section,
-    _add_student_credential_export_section
+    _add_student_credential_export_section,
+    _add_student_data_export_section # NEW IMPORT
 )
 
 
 def render(engine: Engine):
     """
-    Renders three-tab UI for student bulk operations.
+    Renders four-tab UI for student bulk operations.
     """
     
     # Check if degrees exist
@@ -40,10 +45,11 @@ Go to Degrees page to get started.
     # Create tabs
     st.markdown("## 🔥 Student Bulk Operations")
     
-    tab1, tab2, tab3 = st.tabs([
-        "📤 Import Students",
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📥 Import Students",
         "🚚 Student Mover", 
-        "🔑 Export Credentials"
+        "🔑 Export Credentials",
+        "📊 Export Full Data" # NEW TAB
     ])
 
     # Tab 1: Import
@@ -57,3 +63,7 @@ Go to Degrees page to get started.
     # Tab 3: Credentials
     with tab3:
         _add_student_credential_export_section(engine)
+
+    # NEW TAB 4: Full Exporter
+    with tab4:
+        _add_student_data_export_section(engine)

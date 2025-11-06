@@ -141,6 +141,6 @@ def render():
 # Call render only if this is the main module
 if __name__ == "__main__":
     render()
-else:
+#else:
     # If imported as a module, still render (Streamlit pattern)
-    render()
+#    render()

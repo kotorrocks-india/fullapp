@@ -26,26 +26,72 @@ def _has_column(conn, table_name: str, col: str) -> bool:
     ), {"table": table_name, "col": col}).fetchone()
     return bool(row)
 
-def _approvals_columns(conn):
+def _approvals_columns(conn) -> set[str]:
     cols = {r[1] for r in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall()}
     return cols
 
-def _queue_approval(conn, object_type, object_id, action, requester_email, payload: dict):
+def _queue_approval(
+    conn,
+    object_type: str,
+    object_id,
+    action: str,
+    requester_email: str | None,
+    payload: dict | None = None,
+    reason: str | None = None,
+    rule_value: str | None = None,
+) -> None:
+    """
+    Schema-aware insert into approvals, aligned with the new approval management.
+
+    - Always writes object_type, object_id, action, status='pending'.
+    - Writes requester_email and requester if those columns exist.
+    - Writes payload as JSON if the column exists.
+    - Writes reason_note from explicit 'reason' or payload['note']/payload['reason'].
+    - Writes rule only if an explicit rule_value is provided.
+    """
     cols = _approvals_columns(conn)
-    fields = ["object_type","object_id","action","status"]
-    values = [":ot",":oid",":ac","'pending'"]
-    params = {"ot": object_type, "oid": object_id, "ac": action}
+    object_id_str = str(object_id)
 
-    if "requester_email" in cols:
-        fields.append("requester_email"); values.append(":re"); params["re"] = requester_email
-    if "rule" in cols:
-        fields.append("rule"); values.append(":rl"); params["rl"] = "either_one"
+    fields = ["object_type", "object_id", "action", "status"]
+    params = {
+        "object_type": object_type,
+        "object_id": object_id_str,
+        "action": action,
+        "status": "pending",
+    }
+
+    # requester_email / requester
+    if requester_email:
+        if "requester_email" in cols:
+            fields.append("requester_email")
+            params["requester_email"] = requester_email
+        if "requester" in cols:
+            fields.append("requester")
+            params["requester"] = requester_email
+
+    # payload JSON
+    payload = payload or {}
     if "payload" in cols:
-        fields.append("payload"); values.append(":pl"); params["pl"] = json.dumps(payload)
-    if "reason_note" in cols:
-        fields.append("reason_note"); values.append(":rn"); params["rn"] = payload.get("note","")
+        fields.append("payload")
+        params["payload"] = json.dumps(payload)
 
-    sql = f"INSERT INTO approvals({', '.join(fields)}) VALUES({', '.join(values)})"
+    # reason_note (prefer explicit reason, then payload['note'] / payload['reason'])
+    reason_text = (
+        (reason or "").strip()
+        or str(payload.get("note", "")).strip()
+        or str(payload.get("reason", "")).strip()
+    )
+    if "reason_note" in cols:
+        fields.append("reason_note")
+        params["reason_note"] = reason_text
+
+    # rule – only if explicitly provided
+    if rule_value and "rule" in cols:
+        fields.append("rule")
+        params["rule"] = rule_value
+
+    placeholders = ", ".join(f":{f}" for f in fields)
+    sql = f"INSERT INTO approvals({', '.join(fields)}) VALUES({placeholders})"
     conn.execute(sa_text(sql), params)
 
 def _degrees(conn):
@@ -519,14 +565,19 @@ def render():
                     type="primary",
                     disabled=(config_locked or mr_view_only or not can_edit)):
             with engine.begin() as conn:
-                _queue_approval(conn, "semesters", degree_code, "binding_change",
-                              requester_email=actor,
-                              payload={
-                                  "from": current_binding, 
-                                  "to": new_binding, 
-                                  "auto_rebuild": True,
-                                  "note": f"Change semester binding from {current_binding} to {new_binding}"
-                              })
+                _queue_approval(
+                    conn,
+                    "semesters",
+                    degree_code,
+                    "binding_change",
+                    requester_email=actor,
+                    payload={
+                        "from": current_binding,
+                        "to": new_binding,
+                        "auto_rebuild": True,
+                    },
+                    reason=f"Change semester binding from {current_binding} to {new_binding}",
+                )
             st.success(f"Binding change to '{new_binding.upper()}' submitted for approval.")
             st.info("After approval, you'll be able to configure semesters at the selected level.")
             # Original code already correctly used st.stop() here.
@@ -590,15 +641,20 @@ def render():
                         use_container_width=True):
                 if have_semesters and (int(y) != years_val or int(t) != tpy_val):
                     with engine.begin() as conn:
-                        _queue_approval(conn, "semesters", f"{target}:{key}", "edit_structure",
-                                      requester_email=actor,
-                                      payload={
-                                          "years_from": years_val, 
-                                          "tpy_from": tpy_val,
-                                          "years_to": int(y), 
-                                          "tpy_to": int(t),
-                                          "reason": "Edit years/terms requires approval when child data exists"
-                                      })
+                        _queue_approval(
+                            conn,
+                            "semesters",
+                            f"{target}:{key}",
+                            "edit_structure",
+                            requester_email=actor,
+                            payload={
+                                "years_from": years_val,
+                                "tpy_from": tpy_val,
+                                "years_to": int(y),
+                                "tpy_to": int(t),
+                            },
+                            reason="Edit years/terms requires approval when child data exists",
+                        )
                     st.info("Structure change submitted for approval (existing semesters detected).")
                     # UI FIX: Use st.stop() instead of st.rerun() to keep inputs
                     st.stop()
@@ -616,14 +672,19 @@ def render():
                         use_container_width=True):
                 if have_semesters:
                     with engine.begin() as conn:
-                        _queue_approval(conn, "semesters", f"{target}:{key}", "rebuild_semesters",
-                                      requester_email=actor,
-                                      payload={
-                                          "note": f"Request to rebuild semesters for {target} {key}",
-                                          "binding_mode": current_binding,
-                                          "label_mode": current_label_mode,
-                                          "target_id": key
-                                      })
+                        _queue_approval(
+                            conn,
+                            "semesters",
+                            f"{target}:{key}",
+                            "rebuild_semesters",
+                            requester_email=actor,
+                            payload={
+                                "binding_mode": current_binding,
+                                "label_mode": current_label_mode,
+                                "target_id": key,
+                            },
+                            reason=f"Request to rebuild semesters for {target} {key}",
+                        )
                     st.info("Rebuild request submitted for approval (existing semesters detected).")
                     st.stop()
                 else:
@@ -714,9 +775,15 @@ def render():
                     disabled=quick_actions_disabled):
             if semesters_exist:
                 with engine.begin() as conn:
-                    _queue_approval(conn, "semesters", degree_code, "clear_all_semesters",
-                                  requester_email=actor,
-                                  payload={"note": "Request to clear all semesters for degree."})
+                    _queue_approval(
+                        conn,
+                        "semesters",
+                        degree_code,
+                        "clear_all_semesters",
+                        requester_email=actor,
+                        payload={},
+                        reason="Request to clear all semesters for degree.",
+                    )
                 st.info("Request to clear all semesters submitted for approval.")
                 st.stop()
             else:
@@ -733,13 +800,18 @@ def render():
                     disabled=quick_actions_disabled):
             if semesters_exist:
                 with engine.begin() as conn:
-                    _queue_approval(conn, "semesters", degree_code, "rebuild_all_semesters",
-                                  requester_email=actor,
-                                  payload={
-                                      "note": "Request to rebuild all semesters for degree.",
-                                      "binding_mode": current_binding,
-                                      "label_mode": current_label_mode
-                                  })
+                    _queue_approval(
+                        conn,
+                        "semesters",
+                        degree_code,
+                        "rebuild_all_semesters",
+                        requester_email=actor,
+                        payload={
+                            "binding_mode": current_binding,
+                            "label_mode": current_label_mode,
+                        },
+                        reason="Request to rebuild all semesters for degree.",
+                    )
                 st.info("Rebuild request submitted for approval (existing semesters detected).")
                 st.stop()
             else:

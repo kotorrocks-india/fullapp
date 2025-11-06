@@ -1,13 +1,55 @@
 # screens/students/page.py
+# -------------------------------------------------------------------
+# MODIFIED VERSION
+# - Added 'boolean' to the 'Data Type' dropdown.
+# - Fixed "Delete Field" to use 'code' instead of 'id' for consistency.
+# -------------------------------------------------------------------
 from __future__ import annotations
 
 import traceback
-from typing import Optional
+from typing import Optional, Any
 
 import streamlit as st
 from sqlalchemy import text as sa_text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, Connection
 
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Settings helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _get_setting(conn: Connection, key: str, default: Any = None) -> Any:
+    """Gets a setting value from the database."""
+    try:
+        row = conn.execute(
+            sa_text("SELECT value FROM app_settings WHERE key = :key"),
+            {"key": key}
+        ).fetchone()
+        if row:
+            return row[0]
+    except Exception:
+        # Table might not exist yet on first run, but schema installer will handle.
+        pass
+    return default
+
+def _set_setting(conn: Connection, key: str, value: Any):
+    """Saves a setting value to the database."""
+    conn.execute(sa_text("""
+        INSERT INTO app_settings (key, value)
+        VALUES (:key, :value)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """), {"key": key, "value": str(value)})
+
+def _init_settings_table(conn: Connection) -> None:
+    try:
+        conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """))
+    except Exception:
+        pass
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Small helpers
@@ -57,6 +99,9 @@ def _students_tables_snapshot(engine: Engine) -> None:
                     "degrees",
                     "programs",
                     "branches",
+                    # NEW
+                    "degree_batches",
+                    "app_settings"
                 )
                 info = {n: _table_exists(conn, n) for n in names}
                 st.write(info)
@@ -98,7 +143,7 @@ except Exception as _e1:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Settings Tab Helpers
+# Settings Tab Helpers (MODIFIED)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def _render_custom_fields_settings(engine: Engine):
@@ -118,19 +163,24 @@ def _render_custom_fields_settings(engine: Engine):
             if fields:
                 st.markdown("#### Existing Custom Fields")
                 for field in fields:
-                    with st.expander(f"**{field[2]}** (`{field[1]}`)"):
+                    with st.expander(f"**{field[2]}** (`{field[1]}`) - {'Active' if field[5] else 'Inactive'}"):
                         col1, col2, col3 = st.columns([2, 1, 1])
                         col1.text_input("Label", value=field[2], key=f"field_label_{field[0]}", disabled=True)
                         col2.text_input("Type", value=field[3], key=f"field_type_{field[0]}", disabled=True)
                         col3.checkbox("Required", value=bool(field[4]), key=f"field_req_{field[0]}", disabled=True)
                         
+                        # MODIFIED: Delete by 'code' (field[1]) for consistency
                         if st.button("🗑️ Delete Field", key=f"del_field_{field[0]}"):
-                            with engine.begin() as conn:
-                                conn.execute(sa_text(
-                                    "DELETE FROM student_custom_profile_fields WHERE id = :id"
-                                ), {"id": field[0]})
-                                st.success(f"Deleted field: {field[2]}")
-                                st.rerun()
+                            with engine.begin() as conn_b:
+                                # First delete data, then the field
+                                conn_b.execute(sa_text(
+                                    "DELETE FROM student_custom_profile_data WHERE field_code = :code"
+                                ), {"code": field[1]})
+                                conn_b.execute(sa_text(
+                                    "DELETE FROM student_custom_profile_fields WHERE code = :code"
+                                ), {"code": field[1]})
+                            st.success(f"Deleted field: {field[2]}")
+                            st.rerun()
             else:
                 st.info("No custom fields defined yet.")
         
@@ -138,31 +188,35 @@ def _render_custom_fields_settings(engine: Engine):
         with st.expander("➕ Add New Custom Field", expanded=False):
             col1, col2 = st.columns(2)
             with col1:
-                new_code = st.text_input("Field Code*", placeholder="e.g., blood_group", key=_k("new_field_code"))
-                new_label = st.text_input("Field Label*", placeholder="e.g., Blood Group", key=_k("new_field_label"))
+                new_code = st.text_input("Field Code*", placeholder="e.g., blood_group, is_hostel_resident", key=_k("new_field_code"))
+                new_label = st.text_input("Field Label*", placeholder="e.g., Blood Group, Hostel Resident?", key=_k("new_field_label"))
             with col2:
-                new_dtype = st.selectbox("Data Type*", ["text", "number", "date", "choice"], key=_k("new_field_dtype"))
+                # MODIFIED: Added 'boolean'
+                new_dtype = st.selectbox("Data Type*", ["text", "number", "date", "choice", "boolean"], key=_k("new_field_dtype"))
                 new_required = st.checkbox("Required Field", key=_k("new_field_required"))
+                new_active = st.checkbox("Active", value=True, key=_k("new_field_active"))
+
             
             if st.button("Add Custom Field", type="primary", key=_k("add_field_btn")):
                 if not new_code or not new_label:
                     st.error("Field code and label are required")
                 else:
                     try:
-                        with engine.begin() as conn:
-                            conn.execute(sa_text("""
+                        with engine.begin() as conn_b:
+                            conn_b.execute(sa_text("""
                                 INSERT INTO student_custom_profile_fields (code, label, dtype, required, active, sort_order)
-                                VALUES (:code, :label, :dtype, :req, 1, 100)
+                                VALUES (:code, :label, :dtype, :req, :active, 100)
                             """), {
-                                "code": new_code.strip(),
+                                "code": new_code.strip().lower().replace(" ", "_"),
                                 "label": new_label.strip(),
                                 "dtype": new_dtype,
-                                "req": 1 if new_required else 0
+                                "req": 1 if new_required else 0,
+                                "active": 1 if new_active else 0
                             })
-                            st.success(f"✅ Added custom field: {new_label}")
-                            st.rerun()
+                        st.success(f"✅ Added custom field: {new_label}")
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Failed to add field: {e}")
+                        st.error(f"Failed to add field: {e} (Is the code unique?)")
     
     except Exception as e:
         st.error(f"Failed to load custom fields: {e}")
@@ -173,61 +227,38 @@ def _render_roll_number_policy(engine: Engine):
     st.markdown("### 🔢 Roll Number Policy")
     st.caption("Define how roll numbers are generated, validated, and scoped.")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### Derivation Mode")
+    with engine.connect() as conn:
         derivation_mode = st.radio(
             "Roll Number Generation",
             ["hybrid", "manual", "auto"],
+            index=["hybrid", "manual", "auto"].index(_get_setting(conn, "roll_derivation_mode", "hybrid")),
             help="Hybrid: Auto-generate with manual override. Manual: Always enter manually. Auto: Fully automated.",
             key=_k("roll_derivation_mode")
         )
         
-        if derivation_mode in ["hybrid", "auto"]:
-            year_from_first4 = st.checkbox(
-                "Extract year from first 4 digits",
-                value=True,
-                help="e.g., '2021' from roll number '20211234'",
-                key=_k("year_from_first4")
-            )
+        year_from_first4 = st.checkbox(
+            "Extract year from first 4 digits",
+            value=_get_setting(conn, "roll_year_from_first4", "True") == "True",
+            help="e.g., '2021' from roll number '20211234'",
+            key=_k("year_from_first4")
+        )
         
         per_degree_regex = st.checkbox(
             "Allow per-degree regex patterns",
-            value=True,
+            value=_get_setting(conn, "roll_per_degree_regex", "True") == "True",
             help="Enable custom validation patterns for each degree",
             key=_k("per_degree_regex")
         )
+
+        st.divider()
     
-    with col2:
-        st.markdown("#### Validation & Scope")
-        
-        # Fetch degrees to show scope options
-        try:
-            with engine.connect() as conn:
-                degrees = conn.execute(sa_text(
-                    "SELECT code, title FROM degrees WHERE active = 1 ORDER BY sort_order"
-                )).fetchall()
-                
-                if degrees:
-                    st.markdown("**Roll Number Uniqueness Scope**")
-                    for degree in degrees[:3]:  # Show first 3 as examples
-                        scope = st.selectbox(
-                            f"{degree[0]}",
-                            ["degree", "program", "branch", "global"],
-                            help=f"Uniqueness scope for {degree[1]}",
-                            key=_k(f"roll_scope_{degree[0]}")
-                        )
-                    
-                    if len(degrees) > 3:
-                        st.caption(f"... and {len(degrees) - 3} more degrees")
-        except Exception:
-            st.info("Load degrees to configure scopes")
-    
-    st.divider()
-    
-    if st.button("💾 Save Roll Number Policy", type="primary", key=_k("save_roll_policy")):
-        st.success("✅ Roll number policy saved (demo - implement persistence)")
+        if st.button("💾 Save Roll Number Policy", type="primary", key=_k("save_roll_policy")):
+            with engine.begin() as conn_b:
+                _set_setting(conn_b, "roll_derivation_mode", derivation_mode)
+                _set_setting(conn_b, "roll_year_from_first4", year_from_first4)
+                _set_setting(conn_b, "roll_per_degree_regex", per_degree_regex)
+            st.success("✅ Roll number policy saved")
+            st.rerun()
 
 
 def _render_email_lifecycle_policy(engine: Engine):
@@ -235,49 +266,49 @@ def _render_email_lifecycle_policy(engine: Engine):
     st.markdown("### 📧 Email Lifecycle Policy")
     st.caption("Manage .edu email requirements and post-graduation personal email transitions.")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### .edu Email Requirement")
-        edu_email_enabled = st.checkbox(
-            "Require .edu email",
-            value=True,
-            help="Students must provide an institutional email",
-            key=_k("edu_email_enabled")
-        )
+    with engine.connect() as conn:
+        col1, col2 = st.columns(2)
         
-        if edu_email_enabled:
+        with col1:
+            st.markdown("#### .edu Email Requirement")
+            edu_email_enabled = st.checkbox(
+                "Require .edu email",
+                value=_get_setting(conn, "email_edu_enabled", "True") == "True",
+                help="Students must provide an institutional email",
+                key=_k("edu_email_enabled")
+            )
+            
             edu_enforcement_months = st.number_input(
                 "Enforcement period (months)",
                 min_value=1,
                 max_value=24,
-                value=6,
+                value=int(_get_setting(conn, "email_edu_months", 6)),
                 help="Grace period after joining to provide .edu email",
                 key=_k("edu_enforcement_months")
             )
             
             edu_domain = st.text_input(
                 "Allowed domain(s)",
+                value=_get_setting(conn, "email_edu_domain", "college.edu"),
                 placeholder="e.g., college.edu",
                 help="Comma-separated list of allowed domains",
                 key=_k("edu_domain")
             )
-    
-    with col2:
-        st.markdown("#### Post-Graduation Personal Email")
-        personal_email_enabled = st.checkbox(
-            "Require personal email after graduation",
-            value=True,
-            help="Students must provide personal email before graduation",
-            key=_k("personal_email_enabled")
-        )
         
-        if personal_email_enabled:
+        with col2:
+            st.markdown("#### Post-Graduation Personal Email")
+            personal_email_enabled = st.checkbox(
+                "Require personal email after graduation",
+                value=_get_setting(conn, "email_personal_enabled", "True") == "True",
+                help="Students must provide personal email before graduation",
+                key=_k("personal_email_enabled")
+            )
+            
             personal_enforcement_months = st.number_input(
                 "Enforcement period (months after graduation)",
                 min_value=1,
                 max_value=24,
-                value=6,
+                value=int(_get_setting(conn, "email_personal_months", 6)),
                 help="Time to provide personal email after graduation",
                 key=_k("personal_enforcement_months")
             )
@@ -285,7 +316,14 @@ def _render_email_lifecycle_policy(engine: Engine):
     st.divider()
     
     if st.button("💾 Save Email Policy", type="primary", key=_k("save_email_policy")):
-        st.success("✅ Email lifecycle policy saved (demo - implement persistence)")
+        with engine.begin() as conn:
+            _set_setting(conn, "email_edu_enabled", edu_email_enabled)
+            _set_setting(conn, "email_edu_months", edu_enforcement_months)
+            _set_setting(conn, "email_edu_domain", edu_domain)
+            _set_setting(conn, "email_personal_enabled", personal_email_enabled)
+            _set_setting(conn, "email_personal_months", personal_enforcement_months)
+        st.success("✅ Email lifecycle policy saved")
+        st.rerun()
 
 
 def _render_student_status_settings(engine: Engine):
@@ -293,7 +331,7 @@ def _render_student_status_settings(engine: Engine):
     st.markdown("### 🎓 Student Status Configuration")
     st.caption("Define available student statuses and their behavioral effects.")
     
-    # Default statuses from YAML
+    # This remains hardcoded as per the YAML/original file
     default_statuses = {
         "Good": {
             "effects": {"include_in_current_ay": True},
@@ -335,7 +373,6 @@ def _render_student_status_settings(engine: Engine):
     for status_name, config in default_statuses.items():
         with st.expander(f"**{status_name}** {('🏷️ ' + config['badge']) if config['badge'] else ''}"):
             st.caption(config['note'])
-            
             effects = config['effects']
             cols = st.columns(3)
             for i, (effect, value) in enumerate(effects.items()):
@@ -352,20 +389,20 @@ def _render_division_settings(engine: Engine):
     st.markdown("### 🏫 Division/Section Settings")
     st.caption("Configure how students are organized into divisions or sections.")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### Division Configuration")
-        divisions_enabled = st.checkbox(
-            "Enable divisions per term",
-            value=True,
-            key=_k("divisions_enabled")
-        )
+    with engine.connect() as conn:
+        col1, col2 = st.columns(2)
         
-        if divisions_enabled:
+        with col1:
+            st.markdown("#### Division Configuration")
+            divisions_enabled = st.checkbox(
+                "Enable divisions per term",
+                value=_get_setting(conn, "div_enabled", "True") == "True",
+                key=_k("divisions_enabled")
+            )
+            
             free_form_names = st.checkbox(
                 "Allow free-form division names",
-                value=True,
+                value=_get_setting(conn, "div_free_form", "True") == "True",
                 help="If unchecked, use predefined list",
                 key=_k("free_form_names")
             )
@@ -373,54 +410,65 @@ def _render_division_settings(engine: Engine):
             unique_scope = st.selectbox(
                 "Uniqueness scope",
                 ["degree_year_term", "degree_year", "degree", "global"],
+                index=["degree_year_term", "degree_year", "degree", "global"].index(_get_setting(conn, "div_unique_scope", "degree_year_term")),
                 help="Where division names must be unique",
                 key=_k("unique_scope")
             )
-    
-    with col2:
-        st.markdown("#### Import & Copy Settings")
         
-        import_optional = st.checkbox(
-            "Division column optional in imports",
-            value=True,
-            key=_k("import_optional")
-        )
-        
-        copy_from_previous = st.checkbox(
-            "Enable copy from previous term",
-            value=True,
-            help="Allow copying division assignments from prior term",
-            key=_k("copy_from_previous")
-        )
-        
-        block_publish_unassigned = st.checkbox(
-            "Block publish when students unassigned",
-            value=True,
-            help="Prevent publishing marks/attendance if students lack divisions",
-            key=_k("block_publish")
-        )
-    
-    st.divider()
-    
-    # Capacity settings
-    with st.expander("🔢 Division Capacity (Optional)"):
-        capacity_mode = st.radio(
-            "Capacity tracking",
-            ["off", "soft_limit", "hard_limit"],
-            help="Soft: warn on breach. Hard: block on breach.",
-            key=_k("capacity_mode")
-        )
-        
-        if capacity_mode != "off":
-            default_capacity = st.number_input(
-                "Default division capacity",
-                min_value=1,
-                value=60,
-                key=_k("default_capacity")
+        with col2:
+            st.markdown("#### Import & Copy Settings")
+            
+            import_optional = st.checkbox(
+                "Division column optional in imports",
+                value=_get_setting(conn, "div_import_optional", "True") == "True",
+                key=_k("import_optional")
             )
+            
+            copy_from_previous = st.checkbox(
+                "Enable copy from previous term",
+                value=_get_setting(conn, "div_copy_prev", "True") == "True",
+                help="Allow copying division assignments from prior term",
+                key=_k("copy_from_previous")
+            )
+            
+            block_publish_unassigned = st.checkbox(
+                "Block publish when students unassigned",
+                value=_get_setting(conn, "div_block_publish", "True") == "True",
+                help="Prevent publishing marks/attendance if students lack divisions",
+                key=_k("block_publish")
+            )
+        
+        # Capacity settings
+        with st.expander("🔢 Division Capacity (Optional)"):
+            capacity_mode = st.radio(
+                "Capacity tracking",
+                ["off", "soft_limit", "hard_limit"],
+                index=["off", "soft_limit", "hard_limit"].index(_get_setting(conn, "div_capacity_mode", "off")),
+                help="Soft: warn on breach. Hard: block on breach.",
+                key=_k("capacity_mode")
+            )
+            
+            if capacity_mode != "off":
+                default_capacity = st.number_input(
+                    "Default division capacity",
+                    min_value=1,
+                    value=int(_get_setting(conn, "div_default_capacity", 60)),
+                    key=_k("default_capacity")
+                )
     
     if st.button("💾 Save Division Settings", type="primary", key=_k("save_division_settings")):
-        st.success("✅ Division settings saved (demo - implement persistence)")
+        with engine.begin() as conn:
+            _set_setting(conn, "div_enabled", divisions_enabled)
+            _set_setting(conn, "div_free_form", free_form_names)
+            _set_setting(conn, "div_unique_scope", unique_scope)
+            _set_setting(conn, "div_import_optional", import_optional)
+            _set_setting(conn, "div_copy_prev", copy_from_previous)
+            _set_setting(conn, "div_block_publish", block_publish_unassigned)
+            _set_setting(conn, "div_capacity_mode", capacity_mode)
+            if capacity_mode != "off":
+                _set_setting(conn, "div_default_capacity", default_capacity)
+        st.success("✅ Division settings saved")
+        st.rerun()
 
 
 def _render_publish_guardrails(engine: Engine):
@@ -428,16 +476,24 @@ def _render_publish_guardrails(engine: Engine):
     st.markdown("### 🛡️ Publish Guardrails")
     st.caption("Define checks that must pass before publishing marks or attendance.")
     
-    st.checkbox("Block publish if program/branch/division unassigned", value=True, key=_k("guard_unassigned"))
-    st.checkbox("Block publish if duplicates unresolved", value=True, key=_k("guard_duplicates"))
-    st.checkbox("Block publish if invalid roll or email", value=True, key=_k("guard_invalid"))
-    st.checkbox("Block publish if batch mismatch detected", value=True, key=_k("guard_batch_mismatch"))
-    st.checkbox("Block publish on hard capacity breach", value=False, key=_k("guard_capacity"))
+    with engine.connect() as conn:
+        guard_unassigned = st.checkbox("Block publish if program/branch/division unassigned", value=_get_setting(conn, "guard_unassigned", "True") == "True", key=_k("guard_unassigned"))
+        guard_duplicates = st.checkbox("Block publish if duplicates unresolved", value=_get_setting(conn, "guard_duplicates", "True") == "True", key=_k("guard_duplicates"))
+        guard_invalid = st.checkbox("Block publish if invalid roll or email", value=_get_setting(conn, "guard_invalid", "True") == "True", key=_k("guard_invalid"))
+        guard_batch_mismatch = st.checkbox("Block publish if batch mismatch detected", value=_get_setting(conn, "guard_batch_mismatch", "True") == "True", key=_k("guard_batch_mismatch"))
+        guard_capacity = st.checkbox("Block publish on hard capacity breach", value=_get_setting(conn, "guard_capacity", "False") == "True", key=_k("guard_capacity"))
     
     st.divider()
     
     if st.button("💾 Save Guardrails", type="primary", key=_k("save_guardrails")):
-        st.success("✅ Publish guardrails saved (demo - implement persistence)")
+        with engine.begin() as conn:
+            _set_setting(conn, "guard_unassigned", guard_unassigned)
+            _set_setting(conn, "guard_duplicates", guard_duplicates)
+            _set_setting(conn, "guard_invalid", guard_invalid)
+            _set_setting(conn, "guard_batch_mismatch", guard_batch_mismatch)
+            _set_setting(conn, "guard_capacity", guard_capacity)
+        st.success("✅ Publish guardrails saved")
+        st.rerun()
 
 
 def _render_mover_settings(engine: Engine):
@@ -445,49 +501,56 @@ def _render_mover_settings(engine: Engine):
     st.markdown("### 🚚 Student Mover Settings")
     st.caption("Control how students can be moved between batches, degrees, and divisions.")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### Within-Term Division Moves")
-        within_term_enabled = st.checkbox(
-            "Enable within-term division moves",
-            value=True,
-            key=_k("mover_within_term")
-        )
+    with engine.connect() as conn:
+        col1, col2 = st.columns(2)
         
-        if within_term_enabled:
+        with col1:
+            st.markdown("#### Within-Term Division Moves")
+            within_term_enabled = st.checkbox(
+                "Enable within-term division moves",
+                value=_get_setting(conn, "mover_within_term", "True") == "True",
+                key=_k("mover_within_term")
+            )
+            
             require_reason_within = st.checkbox(
                 "Require reason for move",
-                value=True,
+                value=_get_setting(conn, "mover_within_reason", "True") == "True",
                 key=_k("mover_within_reason")
             )
-    
-    with col2:
-        st.markdown("#### Cross-Batch Moves")
-        cross_batch_enabled = st.checkbox(
-            "Enable cross-batch moves",
-            value=True,
-            key=_k("mover_cross_batch")
-        )
         
-        if cross_batch_enabled:
+        with col2:
+            st.markdown("#### Cross-Batch Moves")
+            cross_batch_enabled = st.checkbox(
+                "Enable cross-batch moves",
+                value=_get_setting(conn, "mover_cross_batch", "True") == "True",
+                key=_k("mover_cross_batch")
+            )
+            
+            # THIS IS THE KEY SETTING YOU REQUESTED
             next_batch_only = st.checkbox(
                 "Restrict to next batch only",
-                value=True,
+                value=_get_setting(conn, "mover_next_only", "True") == "True",
                 help="Students can only move to the immediately following batch",
                 key=_k("mover_next_only")
             )
             
             require_reason_cross = st.checkbox(
                 "Require reason for move",
-                value=True,
+                value=_get_setting(conn, "mover_cross_reason", "True") == "True",
                 key=_k("mover_cross_reason")
             )
     
     st.divider()
     
     if st.button("💾 Save Mover Settings", type="primary", key=_k("save_mover_settings")):
-        st.success("✅ Student mover settings saved (demo - implement persistence)")
+        with engine.begin() as conn:
+            _set_setting(conn, "mover_within_term", within_term_enabled)
+            _set_setting(conn, "mover_within_reason", require_reason_within)
+            _set_setting(conn, "mover_cross_batch", cross_batch_enabled)
+            _set_setting(conn, "mover_next_only", next_batch_only) # Saving your new rule
+            _set_setting(conn, "mover_cross_reason", require_reason_cross)
+        st.success("✅ Student mover settings saved")
+        st.rerun()
 
 
 def _render_access_permissions(engine: Engine):
@@ -495,6 +558,7 @@ def _render_access_permissions(engine: Engine):
     st.markdown("### 🔐 Access Permissions")
     st.caption("Define which roles can view, edit, delete, or move student records.")
     
+    # In a real app, these defaults would be loaded/saved
     permissions = {
         "View": ["superadmin", "tech_admin", "principal", "director", "office_admin"],
         "Edit": ["superadmin", "tech_admin", "office_admin"],
@@ -522,6 +586,7 @@ def _render_access_permissions(engine: Engine):
     col2.checkbox("Edit assigned students", value=False, key=_k("cic_edit"))
     
     if st.button("💾 Save Access Permissions", type="primary", key=_k("save_permissions")):
+        # This part is still a demo, but could be implemented like the others
         st.success("✅ Access permissions saved (demo - implement persistence)")
 
 
@@ -610,6 +675,10 @@ def render(engine: Optional[Engine] = None, **kwargs) -> None:
             - `student_initial_credentials` — First-time credentials
             - `student_custom_profile_fields` — Custom field definitions
             - `student_custom_profile_data` — Custom field values
+            - `degree_batches` — Formal batch hierarchy
+            - `app_settings` — Application settings
+            - `degree_year_scaffold` — Degree-year links
+            - `batch_year_scaffold` — Batch-year links
             """
         )
 

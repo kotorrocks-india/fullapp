@@ -1,4 +1,3 @@
-# app/screens/degrees.py
 from __future__ import annotations
 
 import io
@@ -17,7 +16,7 @@ from core.settings import load_settings
 from core.db import get_engine, init_db, SessionLocal
 from core.forms import tagline, success
 from core.policy import require_page, can_edit_page, user_roles, can_request  # central policy helper (who may request delete)
-from core.approvals_policy import approver_roles, rule, requires_reason
+from core.universal_delete import show_delete_form
 from schemas.degrees_schema import migrate_degrees # <--- 1. ADDED THIS IMPORT
 
 # ------------------ Constraints from Slide 5 (Degrees YAML) ------------------
@@ -413,53 +412,12 @@ def set_active(engine, code: str, active: bool, actor_email: str | None, note: s
 # ---------------------------------------------------------------------------------
 
 
-# ------------------ Delete / Approvals ------------------
-def request_delete_degree(engine, code: str, requester_email: str, reason: str) -> str:
-    if requires_reason(engine, "degree", "delete") and not (reason or "").strip():
-        raise ValueError("Audit reason required")
-
-    with engine.begin() as conn:
-        counts = _children_summary(conn, code)
-        has_children = any(v > 0 for v in counts.values())
-
-        if has_children:
-            approver_set = approver_roles(engine, "degree", "delete", degree=code)
-            rule_name    = rule(engine, "degree", "delete", degree=code)
-
-            # approvals table may have requester_email OR requester; detect at runtime
-            cols = {c[1] for c in conn.execute(sa_text("PRAGMA table_info(approvals)")).fetchall()}
-
-            fields = ["object_type","object_id","action","status"]
-            params = {"object_type":"degree","object_id":code,"action":"delete","status":"pending"}
-
-            if "requester_email" in cols:
-                fields.append("requester_email"); params["requester_email"] = requester_email
-            elif "requester" in cols:
-                fields.append("requester"); params["requester"] = requester_email
-
-            if "rule" in cols and rule_name:
-                fields.append("rule"); params["rule"] = rule_name
-            if "reason_note" in cols:
-                fields.append("reason_note"); params["reason_note"] = reason
-
-            placeholders = ", ".join(":"+f for f in fields)
-            conn.execute(sa_text(f"INSERT INTO approvals({', '.join(fields)}) VALUES({placeholders})"), params)
-
-            conn.execute(sa_text("""
-              INSERT INTO degrees_audit (degree_code, action, note, actor)
-              VALUES (:c, 'delete_request', :note, :actor)
-            """), {"c": code, "note": f"{reason} | children={counts}", "actor": requester_email})
-
-            return "approval_required"
-        else:
-            # No children: hard delete immediately (policy applies to everyone equally)
-            conn.execute(sa_text("DELETE FROM degrees WHERE code=:c"), {"c": code})
-            conn.execute(sa_text("""
-              INSERT INTO degrees_audit (degree_code, action, note, actor)
-              VALUES (:c, 'delete', :note, :actor)
-            """), {"c": code, "note": reason or "no children", "actor": requester_email})
-            return "deleted"
-# ---------------------------------------------------------------------------------
+# ==================================================================
+# ===== FUNCTION DELETED ===========================================
+# ==================================================================
+# The old `request_delete_degree` function (lines 538-592)
+# has been removed. It is now handled by `core.universal_delete`.
+# ==================================================================
 
 
 # ------------------ Import/Export ------------------
@@ -899,7 +857,7 @@ def render():
     with c1:
         if st.button("Download CSV"):
             name, data = export_degrees(engine, "csv")
-            st.download_button("Save CSV", data, file_name=name, mime="text/csv")
+            st.download_button("Save CSV", data, file_name=name, mime="text/cv")
     with c2:
         if st.button("Download Excel"):
             name, data = export_degrees(engine, "excel")
@@ -949,69 +907,83 @@ def render():
     else:
         st.info("Status actions require edit permissions")
 
-    # --- Delete / Request Delete UI (policy-aware; minimal in page) ---
+    # ==================================================================
+    # ===== DANGER ZONE REPLACED =======================================
+    # ==================================================================
+    # The old "Danger zone" block (lines 891-963) has been
+    # replaced with this new block.
+    
+    # --- Delete / Request Delete UI (Using Universal Handler) ---
     st.subheader("Danger zone — Delete / Request Delete")
 
     user = st.session_state.get("user") or {}
     roles = set(user.get("roles") or [])
-    actor = (user.get("email") or user.get("full_name") or "system")
+    # Use email for actor, as 'full_name' might not be unique or may be null
+    actor = (user.get("email") or "system") 
 
-    # Centralized policy: who may *request* a degree delete (not approve)
+    # --- Block 1: Standard Deletion (with Approvals) ---
     can_request_delete = can_request("degree", "delete", roles)
 
     if not can_request_delete:
         st.info("You don't have permission to request deletion for degrees.")
     else:
         with engine.begin() as conn:
-            del_codes = [r[0] for r in conn.execute(sa_text("SELECT code FROM degrees ORDER BY code"))]
+            all_degrees = conn.execute(sa_text("SELECT code, title FROM degrees ORDER BY code")).fetchall()
+            
+            # Use mapping access to avoid BaseRow.__getitem__ with string keys
+            degree_options = {
+                row._mapping['code']: f"{row._mapping['code']} - {row._mapping['title']}"
+                for row in all_degrees
+            }
 
-        if del_codes:
-            dcol1, dcol2 = st.columns([1, 2])
-            with dcol1:
-                del_sel = st.selectbox("Degree to delete", del_codes, key="deg_del_sel")
-            with dcol2:
-                del_reason = st.text_input("Reason / audit note (required if policy demands)", key="deg_del_reason")
+        if degree_options:
+            del_sel = st.selectbox(
+                "Select a degree to request deletion for",
+                options=degree_options.keys(),
+                format_func=lambda code: degree_options.get(code, code),
+                key="deg_del_sel"
+            )
 
-            # DEBUG: Show why this degree can't be deleted immediately
-            with engine.begin() as conn:
-                children_counts = _children_summary(conn, del_sel)
-                has_children = any(v > 0 for v in children_counts.values())
+            # --- NEW UNIVERSAL DELETE FORM ---
+            # This one function creates the form, text box, dependency check,
+            # and "Request Deletion" button for you.
+            if del_sel:
+                show_delete_form(
+                    engine=engine,
+                    object_type="degree",
+                    object_id=del_sel,
+                    user_email=actor,
+                    display_name=degree_options[del_sel],
+                    degree_code=del_sel  # Pass the degree code for scope
+                )
+        else:
+            st.info("No degrees available to delete.")
+    
+    # --- Block 2: Emergency Delete (Superadmin Override) ---
+    # This is now separate and only protected by CAN_EDIT
+    if CAN_EDIT:
+        st.error("🚨 EMERGENCY DELETE OPTION (Use with caution!)")
+        
+        with engine.begin() as conn:
+            del_codes_emergency = [r[0] for r in conn.execute(sa_text("SELECT code FROM degrees ORDER BY code"))]
 
-                if has_children:
-                    st.warning(f"⚠️ **Degree '{del_sel}' has child records:** {children_counts}")
-                    st.info("Because this degree has child records, deletion requires approval and cannot be done immediately.")
-                else:
-                    st.success(f"✅ **Degree '{del_sel}' has no child records** - can be deleted immediately")
+        if del_codes_emergency:
+            emergency_sel = st.selectbox("Degree to FORCE DELETE", del_codes_emergency, key="deg_emergency_sel")
 
-            if st.button("Delete (or queue approval)", key="deg_del_btn"):
-                try:
-                    result = request_delete_degree(engine, del_sel, actor, del_reason or "")
-                    if result == "deleted":
-                        st.success(f"Degree {del_sel} deleted.")
-                    else:
-                        st.info(f"Delete request for {del_sel} submitted for approval.")
-                    st.cache_data.clear() # <-- FIX: Clear cache on delete/request
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-            # --- FIX 4: Removed hardcoded "BARCH" and added confirmation step ---
-            if CAN_EDIT:
-                st.error("🚨 EMERGENCY DELETE OPTION (Use with caution!)")
-                if st.button(f"🚨 FORCE DELETE {del_sel} AND ALL CHILDREN", type="secondary"):
-                    # Use session state to show a confirmation
-                    st.session_state['confirm_force_delete'] = del_sel
-                    st.rerun() # Rerun to show confirmation
+            if st.button(f"🚨 FORCE DELETE {emergency_sel} AND ALL CHILDREN", type="secondary"):
+                # Use session state to show a confirmation
+                st.session_state['confirm_force_delete'] = emergency_sel
+                st.rerun() # Rerun to show confirmation
 
             # Add this new block to handle the confirmation
-            if 'confirm_force_delete' in st.session_state and st.session_state['confirm_force_delete'] == del_sel:
-                st.warning(f"**Are you absolutely sure you want to delete {del_sel} and all its data?**\n\nThis cannot be undone.")
+            if 'confirm_force_delete' in st.session_state and st.session_state['confirm_force_delete'] == emergency_sel:
+                st.warning(f"**Are you absolutely sure you want to delete {emergency_sel} and all its data?**\n\nThis cannot be undone.")
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("YES, I AM SURE. DELETE.", type="primary"):
                         try:
-                            result = emergency_delete_degree(engine, del_sel, actor)
-                            st.success(f"{del_sel} degree and all children force deleted: {result}")
+                            result = emergency_delete_degree(engine, emergency_sel, actor)
+                            st.success(f"{emergency_sel} degree and all children force deleted: {result}")
                             del st.session_state['confirm_force_delete']
                             st.cache_data.clear() # <-- FIX: Clear cache on emergency delete
                             st.rerun()
@@ -1022,7 +994,12 @@ def render():
                         del st.session_state['confirm_force_delete']
                         st.rerun()
         else:
-            st.info("No degrees available to delete.")
+            st.info("No degrees left for emergency deletion.")
+            
+    # ==================================================================
+    # ===== END OF REPLACED BLOCK ======================================
+    # ==================================================================
+
 
     # DEBUG: Database structure diagnostic
     with st.expander("🔍 Database Diagnostic (Debug)"):
@@ -1032,7 +1009,7 @@ def render():
             st.write("Existing tables:", [t[0] for t in tables])
 
             # Check specific child tables for BARCH
-            if del_codes and "BARCH" in del_codes:
+            if del_codes_emergency and "BARCH" in del_codes_emergency:
                 barch_children = _children_summary(conn, "BARCH")
                 st.write("BARCH child records:", barch_children)
 

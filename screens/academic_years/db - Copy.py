@@ -714,34 +714,6 @@ def compute_terms_with_validation(
         )
         return [], warnings
 
-def _db_get_batches_for_degree(
-    conn: Connection,
-    degree_code: str,
-) -> List[Dict[str, Any]]:
-    """
-    Gets a distinct list of batches for a degree by querying the 
-    student_enrollments table.
-    Returns a list of dicts: [{"code": "batch_code_1"}, ...]
-    """
-    if not _table_exists(conn, "student_enrollments"):
-        return []
-    if not _col_exists(conn, "student_enrollments", "batch"):
-        return []
-    
-    rows = _exec(
-        conn,
-        """
-        SELECT DISTINCT batch AS code 
-        FROM student_enrollments
-        WHERE degree_code = :d
-        ORDER BY batch
-        """,
-        {"d": degree_code}
-    ).fetchall()
-    
-    # Return as list of dicts, as ui.py expects .get("code")
-    return [dict(getattr(r, "_mapping", r)) for r in rows] 
-
 
 # --- NEW FUNCTION ---
 def _db_check_batch_has_students(
